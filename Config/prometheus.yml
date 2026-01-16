@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'volguard'
+    static_configs:
+      # FIXED: Changed from volguard:8080 (which matches docker-compose ports)
+      - targets: ['volguard:8080']
