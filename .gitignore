@@ -1,0 +1,24 @@
+# Security: Never commit environment variables or secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.pytest_cache/
+
+# VolGuard Data & Logs (Local only)
+volguard_data/
+volguard_logs/
+*.db
+*.log
+KILL_SWITCH
+
+# Docker
+.docker_volumes/
+
+# IDE settings
+.vscode/
+.idea/
