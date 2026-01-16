@@ -2915,5 +2915,362 @@ class TradingOrchestrator:
             name="Risk-Manager"
         )
         risk_thread.start()
-        logger.info(f"✅ Trade {trade_id} opened successfully with {len<|im_end|>
+        logger.info(f"✅ Trade {trade_id} opened successfully with {len(gtt_ids)} GTT orders")
+        
+        return trade_id
+
+    def run_auto_mode(self):
+        """Production auto-trading loop with comprehensive error handling"""
+        logger.info("=" * 80)
+        logger.info("STARTING AUTO MODE - PRODUCTION")
+        logger.info("=" * 80)
+        telegram.send("🤖 Auto-trading activated (Production Hardened)", "SYSTEM")
+        
+        # Session validation
+        if not self.session_manager.validate_session(force=True):
+            logger.critical("Session validation failed - cannot start")
+            telegram.send("Session invalid - system stopped", "CRITICAL")
+            return
+        
+        # Market status check
+        if not self.session_manager.check_market_status():
+            logger.info("Market is closed today")
+            telegram.send("Market closed - no trading today", "SYSTEM")
+            return
+        
+        # Startup reconciliation
+        logger.info("Running startup reconciliation...")
+        existing_positions = self.reconciliation.reconcile()
+        
+        if existing_positions:
+            logger.warning(f"Found {len(existing_positions)} existing positions - attaching risk manager")
+            
+            # Get common expiry from reconciled positions
+            common_expiry = existing_positions[0].get('common_expiry', date.today())
+            trade_id = f"RECONCILED_{int(time.time())}"
+            
+            # Create risk manager for existing positions (no GTTs)
+            self.current_risk_manager = RiskManager(
+                self.api_client,
+                existing_positions,
+                common_expiry,
+                trade_id,
+                []  # No GTTs for reconciled positions
+            )
+            
+            risk_thread = threading.Thread(
+                target=self.current_risk_manager.monitor,
+                daemon=True,
+                name="Risk-Manager-Reconciled"
+            )
+            risk_thread.start()
+            
+            logger.info("Risk manager attached to existing positions")
+        
+        # Main trading loop
+        loop_count = 0
+        while True:
+            try:
+                loop_count += 1
+                loop_start_time = time.time()
+                
+                # Update heartbeat
+                heartbeat.beat()
+                
+                # Periodic session validation
+                if loop_count % 60 == 0:  # Every ~60 iterations (minutes)
+                    if not self.session_manager.validate_session():
+                        logger.critical("Session validation failed during loop")
+                        telegram.send("Session expired - stopping auto-trading", "CRITICAL")
+                        break
+                
+                # Cleanup zombie processes periodically
+                if loop_count % 10 == 0:
+                    process_manager.cleanup_zombies()
+                
+                # Periodic position reconciliation (every 5 minutes)
+                if loop_count % (ProductionConfig.POSITION_RECONCILE_INTERVAL // 60) == 0 and loop_count > 0:
+                    logger.debug("Running periodic position reconciliation...")
+                    if not ProductionConfig.DRY_RUN_MODE:
+                        reconciled = self.reconciliation.reconcile()
+                        if reconciled and not self.current_risk_manager:
+                            logger.warning("Found untracked positions - attaching risk manager")
+                            common_expiry = reconciled[0].get('common_expiry', date.today())
+                            self.current_risk_manager = RiskManager(
+                                self.api_client,
+                                reconciled,
+                                common_expiry,
+                                f"RECONCILED_{int(time.time())}",
+                                []
+                            )
+                            threading.Thread(target=self.current_risk_manager.monitor, daemon=True).start()
+                
+                # Weekend check
+                now = datetime.now()
+                if now.weekday() >= 5:
+                    logger.debug("Weekend - sleeping")
+                    time.sleep(3600)
+                    continue
+                
+                # Trading hours check
+                current_time = (now.hour, now.minute)
+                if not (ProductionConfig.SAFE_ENTRY_START <= current_time <= ProductionConfig.SAFE_EXIT_END):
+                    if loop_count % 60 == 0:
+                        logger.debug(f"Outside trading hours: {current_time}")
+                    time.sleep(60)
+                    continue
+                
+                # Check for open positions
+                portfolio_api = PortfolioApi(self.api_client)
+                pos_response = None
+                
+                for attempt in range(3):
+                    try:
+                        pos_response = portfolio_api.get_positions(api_version="2.0")
+                        if pos_response and pos_response.status == 'success':
+                            break
+                    except Exception as e:
+                        logger.error(f"Position check failed (attempt {attempt+1}): {e}")
+                        time.sleep(1)
+                
+                has_open_positions = False
+                if pos_response and pos_response.status == 'success' and pos_response.data:
+                    for p in pos_response.data:
+                        qty = int(p.quantity) if hasattr(p, 'quantity') else 0
+                        if qty != 0:
+                            has_open_positions = True
+                            break
+                
+                if has_open_positions:
+                    if loop_count % 60 == 0:
+                        logger.debug("Positions already open - monitoring active")
+                    time.sleep(60)
+                    continue
+                
+                # Check if analysis is fresh
+                if self.last_analysis:
+                    age = (datetime.now() - self.last_analysis['timestamp']).total_seconds()
+                    if age < ProductionConfig.ANALYSIS_INTERVAL:
+                        if loop_count % 60 == 0:
+                            logger.debug(f"Analysis fresh ({age:.0f}s old)")
+                        time.sleep(60)
+                        continue
+                
+                # Run analysis
+                logger.info(f"Running market analysis (loop {loop_count})...")
+                analysis = self.run_analysis()
+                
+                if not analysis:
+                    logger.warning("Analysis failed - waiting before retry")
+                    time.sleep(600)  # Wait 10 minutes before retry
+                    continue
+                
+                # Execute trade
+                trade_id = self.execute_best_mandate(analysis)
+                
+                if trade_id:
+                    logger.info(f"Trade {trade_id} opened - monitoring active")
+                    
+                    # Wait for position to close before next cycle
+                    position_closed = False
+                    wait_start = time.time()
+                    max_wait = 86400  # 24 hours max
+                    
+                    while not position_closed and (time.time() - wait_start) < max_wait:
+                        heartbeat.beat()
+                        
+                        pos_response = None
+                        for attempt in range(3):
+                            try:
+                                pos_response = portfolio_api.get_positions(api_version="2.0")
+                                if pos_response and pos_response.status == 'success':
+                                    break
+                            except:
+                                time.sleep(1)
+                        
+                        all_closed = True
+                        if pos_response and pos_response.status == 'success' and pos_response.data:
+                            for p in pos_response.data:
+                                qty = int(p.quantity) if hasattr(p, 'quantity') else 0
+                                if qty != 0:
+                                    all_closed = False
+                                    break
+                        
+                        if all_closed:
+                            position_closed = True
+                            logger.info("Position closed - ready for next trade")
+                            break
+                        
+                        time.sleep(60)
+                    
+                    if not position_closed:
+                        logger.warning("Position still open after 24h - continuing anyway")
+                else:
+                    logger.info("No trade executed - waiting for next analysis cycle")
+                    time.sleep(ProductionConfig.ANALYSIS_INTERVAL)
+                
+                # Update system vitals
+                loop_duration = (time.time() - loop_start_time) * 1000
+                db_writer.update_system_vitals(
+                    loop_duration,
+                    psutil.cpu_percent(interval=0.1),
+                    psutil.virtual_memory().percent
+                )
+                
+            except KeyboardInterrupt:
+                logger.info("Auto-trading stopped by user")
+                telegram.send("Auto-trading stopped by user", "SYSTEM")
+                break
+                
+            except Exception as e:
+                logger.error(f"Auto-trading loop error: {e}")
+                traceback.print_exc()
+                telegram.send(f"Loop error: {str(e)}", "ERROR")
+                time.sleep(300)  # Wait 5 minutes after error
+        
+        logger.info("Auto-trading loop exited")
+        self._cleanup_handler()
+
+# ==========================================
+# MAIN ENTRY POINT
+# ==========================================
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="VOLGUARD 3.0 - Production Hardened + Prometheus")
+    parser.add_argument('--mode', choices=['analysis', 'auto'], default='analysis', help='Run mode')
+    parser.add_argument('--skip-confirm', action='store_true', help='Skip confirmation for auto mode')
+    parser.add_argument('--export-journal', type=str, help='Export trade journal to directory')
+    parser.add_argument('--metrics-port', type=int, default=8000, help='Port for Prometheus metrics')
+    args = parser.parse_args()
+    
+    # Banner
+    print("=" * 80)
+    print("VOLGUARD 3.0 - PRODUCTION HARDENED")
+    print("Advanced Option Selling System")
+    if ProductionConfig.DRY_RUN_MODE:
+        print("🎯 DRY RUN MODE - NO REAL TRADES")
+    print("=" * 80)
+    
+    # Export journal if requested
+    if args.export_journal:
+        os.makedirs(args.export_journal, exist_ok=True)
+        if db_writer.export_trade_journal(args.export_journal):
+            print(f"✅ Trade journal exported to {args.export_journal}")
+        else:
+            print("❌ Export failed")
+        return
+    
+    # Validate configuration
+    try:
+        ProductionConfig.validate()
+        logger.info("✅ Configuration validated")
+    except Exception as e:
+        logger.critical(f"❌ Configuration error: {e}")
+        sys.exit(1)
+    
+    # Start Metrics Server
+    try:
+        start_metrics_server(args.metrics_port)
+    except Exception as e:
+        logger.error(f"Failed to start metrics server: {e}")
+
+    # Initialize system
+    db_writer.set_state("system_version", "3.0-PRODUCTION-HARDENED")
+    db_writer.set_state("startup_time", datetime.now().isoformat())
+    db_writer.set_state("dry_run_mode", str(ProductionConfig.DRY_RUN_MODE))
+    logger.info("✅ Database initialized (WAL Mode)")
+    
+    telegram.send(
+        f"🚀 System Startup\n"
+        f"Version: 3.0 Production Hardened\n"
+        f"Mode: {args.mode.upper()}\n"
+        f"Environment: {ProductionConfig.ENVIRONMENT}\n"
+        f"{'📄 DRY RUN - Paper Trading' if ProductionConfig.DRY_RUN_MODE else '💰 LIVE TRADING'}",
+        "SUCCESS"
+    )
+    
+    # Create orchestrator
+    orchestrator = TradingOrchestrator()
+    
+    try:
+        if args.mode == 'analysis':
+            logger.info("Running ANALYSIS mode")
+            result = orchestrator.run_analysis()
+            
+            if result:
+                print("\n" + "=" * 80)
+                print("MARKET ANALYSIS RESULTS")
+                print("=" * 80)
+                
+                w = result['weekly_mandate']
+                m = result['monthly_mandate']
+                
+                print(f"\n📊 WEEKLY MANDATE")
+                print(f"Regime: {w.regime_name}")
+                print(f"Strategy: {w.suggested_structure}")
+                print(f"Score: {w.score.composite:.2f} ({w.score.confidence})")
+                print(f"Allocation: {w.allocation_pct:.1f}% | Max Lots: {w.max_lots}")
+                print(f"Rationale: {', '.join(w.rationale)}")
+                if w.warnings:
+                    print(f"Warnings: {', '.join(w.warnings)}")
+                
+                print(f"\n📊 MONTHLY MANDATE")
+                print(f"Regime: {m.regime_name}")
+                print(f"Strategy: {m.suggested_structure}")
+                print(f"Score: {m.score.composite:.2f} ({m.score.confidence})")
+                print(f"Allocation: {m.allocation_pct:.1f}% | Max Lots: {m.max_lots}")
+                print(f"Rationale: {', '.join(m.rationale)}")
+                if m.warnings:
+                    print(f"Warnings: {', '.join(m.warnings)}")
+                
+                print("\n" + "=" * 80)
+            else:
+                print("❌ Analysis failed")
+                
+        elif args.mode == 'auto':
+            if ProductionConfig.DRY_RUN_MODE:
+                logger.info("🎯 Starting AUTO MODE in DRY RUN (Paper Trading)")
+                orchestrator.run_auto_mode()
+            else:
+                bypass_confirm = os.getenv("VG_AUTO_CONFIRM", "FALSE").upper() == "TRUE"
+                
+                if bypass_confirm or args.skip_confirm:
+                    logger.warning("⚠️ AUTO CONFIRMATION - LIVE TRADING ENABLED")
+                    orchestrator.run_auto_mode()
+                else:
+                    print("\n" + "=" * 80)
+                    print("⚠️  LIVE AUTO MODE REQUESTED")
+                    print("=" * 80)
+                    print("\nThis will enable live trading with REAL MONEY.")
+                    print("Ensure you understand the risks involved.")
+                    print("\nType 'I ACCEPT THE RISK' to continue: ")
+                    
+                    try:
+                        user_input = input().strip()
+                        if user_input == "I ACCEPT THE RISK":
+                            orchestrator.run_auto_mode()
+                        else:
+                            logger.info("Auto mode cancelled by user")
+                            print("Cancelled.")
+                    except EOFError:
+                        logger.critical("No input available. Set VG_AUTO_CONFIRM=TRUE or use --skip-confirm")
+                        sys.exit(1)
+                    
+    except Exception as e:
+        logger.critical(f"Unhandled exception: {e}")
+        traceback.print_exc()
+        telegram.send(f"💥 System crashed: {str(e)}", "CRITICAL")
+        sys.exit(1)
+        
+    finally:
+        logger.info("System shutdown sequence initiated")
+        heartbeat.stop()
+        process_manager.terminate_all()
+        db_writer.shutdown()
+        telegram.send("System shutdown complete", "SYSTEM")
+        logger.info("Goodbye.")
+
+if __name__ == "__main__":
+    main()
+
 
