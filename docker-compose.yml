@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  volguard:
+    build: .
+    container_name: volguard_v42
+    restart: unless-stopped
+    shm_size: 2gb
+    ports:
+      - "8080:8080"          # Metrics exposed on 8080 to host
+    volumes:
+      # Persist app data (SQLite DB) to host folder ./volguard_data
+      - ./volguard_data:/app/data
+      # Persist logs to host folder ./volguard_logs
+      - ./volguard_logs:/app/logs
+      # Mount config folder for easier updates
+      - ./config:/app/config
+    env_file: .env
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: volguard_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      # Mount prometheus config
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Persist prometheus time-series data
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: volguard_dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    user: "0:0"  # Run as root to ensure read access to the SQLite DB bind mount
+    environment:
+      - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=frser-sqlite-datasource
+    volumes:
+      # Mount the SAME host data folder so Grafana can see the SQLite DB
+      - ./volguard_data:/var/lib/grafana/data/volguard_mount:ro
+      # Persist Grafana dashboards/users/settings
+      - grafana_data:/var/lib/grafana
+      # CRITICAL: Auto-provision the SQLite connection
+      - ./config/grafana_datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+
+volumes:
+  prometheus_data:
+  grafana_data:
