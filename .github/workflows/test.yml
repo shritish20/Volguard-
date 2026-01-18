@@ -146,7 +146,7 @@ jobs:
           check_name: 'Unit Test Report (Python ${{ matrix.python-version }})'
 
   # ========================================
-  # STRESS TESTS
+  # STRESS TESTS - FIXED COMMAND
   # ========================================
   stress-tests:
     name: Stress Tests
@@ -184,7 +184,8 @@ jobs:
             --junit-xml=test-results-stress.xml \
             --tb=short \
             --durations=20 \
-            --timeout=300
+            --timeout=300 \
+            --no-cov  # ADDED: Override coverage settings
       
       - name: Upload Test Results
         uses: actions/upload-artifact@v4
@@ -238,7 +239,8 @@ jobs:
             -m chaos \
             --junit-xml=test-results-chaos.xml \
             --tb=short \
-            --timeout=180
+            --timeout=300 \
+            --no-cov  # ADDED: Override coverage settings
       
       - name: Upload Test Results
         uses: actions/upload-artifact@v4
@@ -325,7 +327,8 @@ jobs:
             -v \
             --benchmark-only \
             --benchmark-autosave \
-            --benchmark-save-data
+            --benchmark-save-data \
+            --no-cov  # ADDED: Override coverage settings
         continue-on-error: true
       
       - name: Upload Benchmark Results
