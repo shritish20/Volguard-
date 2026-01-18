@@ -177,15 +177,14 @@ jobs:
       
       - name: Run Stress Tests
         run: |
-          pytest test_stress.py \
+          pytest --no-cov test_stress.py \
             -v \
             -s \
             -m stress \
             --junit-xml=test-results-stress.xml \
             --tb=short \
             --durations=20 \
-            --timeout=300 \
-            --no-cov  # ADDED: Override coverage settings
+            --timeout=300
       
       - name: Upload Test Results
         uses: actions/upload-artifact@v4
@@ -233,14 +232,13 @@ jobs:
       
       - name: Run Chaos Tests
         run: |
-          pytest test_chaos.py \
+          pytest --no-cov test_chaos.py \
             -v \
             -s \
             -m chaos \
             --junit-xml=test-results-chaos.xml \
             --tb=short \
-            --timeout=300 \
-            --no-cov  # ADDED: Override coverage settings
+            --timeout=300
       
       - name: Upload Test Results
         uses: actions/upload-artifact@v4
@@ -323,12 +321,11 @@ jobs:
       
       - name: Run Performance Benchmarks
         run: |
-          pytest test_unit.py test_stress.py \
+          pytest --no-cov test_unit.py test_stress.py \
             -v \
             --benchmark-only \
             --benchmark-autosave \
-            --benchmark-save-data \
-            --no-cov  # ADDED: Override coverage settings
+            --benchmark-save-data
         continue-on-error: true
       
       - name: Upload Benchmark Results
