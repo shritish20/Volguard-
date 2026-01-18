@@ -1,7 +1,7 @@
 """
 VOLGUARD 3.0 - STRESS & LOAD TESTS
 Tests system under extreme load and adverse conditions
-Run: pytest test_stress.py -v -s --durations=10
+Run: pytest test_stress.py -v -s --durations=10 --no-cov
 """
 
 import pytest
@@ -462,6 +462,293 @@ class TestRegimeEngineStress:
             days_to_next_weekly=10
         )
         
+        print(f"\nExtreme Market Conditions Test:")
+        
+        for scenario in scenarios:
+            score = engine.calculate_scores(
+                scenario['vol'], struct, edge, external, time_m, "WEEKLY"
+            )
+            
+            mandate = engine.generate_mandate(
+                score, scenario['vol'], struct, edge, external, time_m,
+                "WEEKLY", time_m.weekly_exp, time_m.dte_weekly
+            )
+            
+            print(f"\n  {scenario['name']}:")
+            print(f"    Composite Score: {score.composite:.2f}")
+            print(f"    Regime: {mandate.regime_name}")
+            print(f"    Allocation: {mandate.allocation_pct:.1f}%")
+            print(f"    Strategy: {mandate.suggested_structure}")
+            
+            # Should produce valid output even in extreme conditions
+            assert 0 <= score.composite <= 10
+            assert 0 <= mandate.allocation_pct <= 100
+            assert mandate.max_lots >= 0
+    
+    @pytest.mark.stress
+    def test_rapid_regime_recalculation(self):
+        """Test regime calculations under rapid fire"""
+        engine = RegimeEngine()
+        
+        vol = VolMetrics(
+            spot=23500, vix=15, rv7=14, rv28=13, rv90=12,
+            garch7=14, garch28=13, park7=14, park28=13,
+            vov=3, vov_zscore=1, ivp_30d=50, ivp_90d=48, ivp_1yr=45,
+            ma20=23400, atr14=350, trend_strength=0.3,
+            vol_regime="FAIR", is_fallback=False
+        )
+        
+        struct = StructMetrics(
+            net_gex=1500000, gex_ratio=0.025, total_oi_value=60000000,
+            gex_regime="STICKY", pcr=1.05, max_pain=23500, skew_25d=1.2,
+            oi_regime="NEUTRAL", lot_size=25
+        )
+        
+        edge = EdgeMetrics(
+            iv_weekly=16, vrp_rv_weekly=2, vrp_garch_weekly=2, vrp_park_weekly=2,
+            iv_monthly=15.5, vrp_rv_monthly=2, vrp_garch_monthly=1.8, vrp_park_monthly=1.8,
+            term_spread=-0.5, term_regime="FLAT", primary_edge="SHORT_GAMMA"
+        )
+        
+        from volguard import ParticipantData
+        external = ExternalMetrics(
+            fii=ParticipantData(150000, 100000, 50000, 80000, 60000, 20000, 70000, 90000, -20000, 30000),
+            dii=None, pro=None, client=None, fii_net_change=5000,
+            flow_regime="MODERATE_LONG", fast_vol=False,
+            data_date="18-Jan-2026", event_risk="LOW"
+        )
+        
+        time_m = TimeMetrics(
+            current_date=date.today(),
+            weekly_exp=date.today() + timedelta(days=3),
+            monthly_exp=date.today() + timedelta(days=25),
+            next_weekly_exp=date.today() + timedelta(days=10),
+            dte_weekly=3, dte_monthly=25,
+            is_gamma_week=False, is_gamma_month=False,
+            days_to_next_weekly=10
+        )
+        
+        num_calculations = 1000
+        start_time = time.time()
+        
+        for _ in range(num_calculations):
+            # Slightly vary inputs
+            vol.spot = 23500 + np.random.randint(-100, 100)
+            vol.vix = 15 + np.random.uniform(-2, 2)
+            
+            score = engine.calculate_scores(
+                vol, struct, edge, external, time_m, "WEEKLY"
+            )
+        
+        elapsed = time.time() - start_time
+        
+        print(f"\nRapid Regime Recalculation Test:")
+        print(f"  Calculations: {num_calculations}")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Calc/sec: {num_calculations/elapsed:.0f}")
+        
+        assert elapsed < 5  # Should be very fast
+
+
+# ============================================================================
+# EXECUTION ENGINE STRESS TESTS
+# ============================================================================
+
+class TestExecutionEngineStress:
+    
+    @pytest.mark.stress
+    def test_concurrent_order_placement(self):
+        """Test execution engine with concurrent order requests"""
+        ProductionConfig.DRY_RUN_MODE = True
+        mock_client = Mock()
+        engine = ExecutionEngine(mock_client)
+        
+        def place_orders(thread_id, count):
+            results = []
+            for i in range(count):
+                order_id = engine.place_order(
+                    f"INST_{thread_id}_{i}",
+                    25,
+                    "BUY" if i % 2 == 0 else "SELL",
+                    "LIMIT",
+                    100.0 + i
+                )
+                results.append(order_id is not None)
+            return sum(results)
+        
+        num_threads = 20
+        orders_per_thread = 50
+        
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [
+                executor.submit(place_orders, t, orders_per_thread)
+                for t in range(num_threads)
+            ]
+            
+            results = [f.result() for f in futures]
+        
+        elapsed = time.time() - start_time
+        total_orders = sum(results)
+        
+        print(f"\nConcurrent Order Placement Test:")
+        print(f"  Threads: {num_threads}")
+        print(f"  Orders per thread: {orders_per_thread}")
+        print(f"  Total orders: {total_orders}/{num_threads * orders_per_thread}")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Orders/sec: {total_orders/elapsed:.0f}")
+        
+        assert total_orders >= num_threads * orders_per_thread * 0.9  # 90% success rate
+    
+    @pytest.mark.stress
+    def test_strategy_execution_under_load(self):
+        """Test full strategy execution with many concurrent legs"""
+        ProductionConfig.DRY_RUN_MODE = True
+        mock_client = Mock()
+        engine = ExecutionEngine(mock_client)
+        
+        # Create complex multi-leg strategy
+        legs = []
+        for i in range(20):  # 20 legs (extreme case)
+            legs.append({
+                'key': f'INST_{i}',
+                'strike': 23000 + (i * 100),
+                'type': 'CE' if i % 2 == 0 else 'PE',
+                'side': 'SELL' if i < 10 else 'BUY',
+                'qty': 25,
+                'ltp': 100.0 - (i * 2),
+                'role': 'CORE' if i < 10 else 'HEDGE',
+                'structure': 'COMPLEX'
+            })
+        
+        start_time = time.time()
+        result = engine.execute_strategy(legs)
+        elapsed = time.time() - start_time
+        
+        print(f"\nComplex Strategy Execution Test:")
+        print(f"  Input legs: {len(legs)}")
+        print(f"  Executed legs: {len(result)}")
+        print(f"  Time: {elapsed:.2f}s")
+        
+        # In paper mode, should execute all or fail gracefully
+        assert isinstance(result, list)
+
+
+# ============================================================================
+# MEMORY & RESOURCE STRESS TESTS
+# ============================================================================
+
+class TestResourceStress:
+    
+    @pytest.mark.stress
+    def test_memory_leak_detection(self):
+        """Test for memory leaks during extended operation"""
+        import tracemalloc
+        
+        tracemalloc.start()
+        
+        db_path = "/tmp/leak_test_db.db"
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        
+        # Get baseline
+        gc.collect()
+        baseline = tracemalloc.get_traced_memory()[0]
+        
+        db = DatabaseWriter(db_path)
+        
+        # Perform 1000 operations
+        for cycle in range(10):
+            for i in range(100):
+                db.log_order(f"ORDER_{cycle}_{i}", "KEY", "BUY", 25, 100.0, "FILLED")
+                db.set_state(f"key_{i % 10}", str(time.time()))
+            
+            time.sleep(0.5)
+            gc.collect()
+            
+            current, peak = tracemalloc.get_traced_memory()
+            growth = (current - baseline) / 1024 / 1024  # MB
+            
+            if cycle % 3 == 0:
+                print(f"  Cycle {cycle}: Memory growth: {growth:.2f} MB")
+        
+        final_current, final_peak = tracemalloc.get_traced_memory()
+        final_growth = (final_current - baseline) / 1024 / 1024
+        
+        tracemalloc.stop()
+        db.shutdown()
+        
+        print(f"\nMemory Leak Detection Test:")
+        print(f"  Total operations: 1000")
+        print(f"  Final memory growth: {final_growth:.2f} MB")
+        print(f"  Peak memory: {final_peak / 1024 / 1024:.2f} MB")
+        
+        # Should not grow excessively (< 50MB for 1000 ops)
+        assert final_growth < 50
+        
+        os.remove(db_path)
+    
+    @pytest.mark.stress
+    def test_cpu_intensive_calculations(self):
+        """Test CPU usage under intensive calculations"""
+        engine = RegimeEngine()
+        
+        # Create dataset for intensive calculations
+        vol_scenarios = []
+        for i in range(100):
+            vol_scenarios.append(VolMetrics(
+                spot=23000 + i * 10,
+                vix=10 + i * 0.2,
+                rv7=9 + i * 0.18,
+                rv28=8 + i * 0.16,
+                rv90=7 + i * 0.14,
+                garch7=9 + i * 0.18,
+                garch28=8 + i * 0.16,
+                park7=9 + i * 0.18,
+                park28=8 + i * 0.16,
+                vov=2 + i * 0.03,
+                vov_zscore=0 + i * 0.02,
+                ivp_30d=20 + i * 0.6,
+                ivp_90d=18 + i * 0.58,
+                ivp_1yr=15 + i * 0.55,
+                ma20=23000 + i * 10,
+                atr14=200 + i * 3,
+                trend_strength=0.1 + i * 0.005,
+                vol_regime="FAIR",
+                is_fallback=False
+            ))
+        
+        struct = StructMetrics(
+            net_gex=1000000, gex_ratio=0.02, total_oi_value=50000000,
+            gex_regime="NEUTRAL", pcr=1.0, max_pain=23500, skew_25d=0,
+            oi_regime="NEUTRAL", lot_size=25
+        )
+        
+        edge = EdgeMetrics(
+            iv_weekly=16, vrp_rv_weekly=2, vrp_garch_weekly=2, vrp_park_weekly=2,
+            iv_monthly=15, vrp_rv_monthly=1.8, vrp_garch_monthly=1.6, vrp_park_monthly=1.7,
+            term_spread=-1, term_regime="FLAT", primary_edge="SHORT_GAMMA"
+        )
+        
+        from volguard import ParticipantData
+        external = ExternalMetrics(
+            fii=ParticipantData(150000, 100000, 50000, 80000, 60000, 20000, 70000, 90000, -20000, 30000),
+            dii=None, pro=None, client=None, fii_net_change=5000,
+            flow_regime="MODERATE_LONG", fast_vol=False,
+            data_date="18-Jan-2026", event_risk="LOW"
+        )
+        
+        time_m = TimeMetrics(
+            current_date=date.today(),
+            weekly_exp=date.today() + timedelta(days=3),
+            monthly_exp=date.today() + timedelta(days=25),
+            next_weekly_exp=date.today() + timedelta(days=10),
+            dte_weekly=3, dte_monthly=25,
+            is_gamma_week=False, is_gamma_month=False,
+            days_to_next_weekly=10
+        )
+        
         process = psutil.Process()
         cpu_before = process.cpu_percent(interval=0.1)
         
@@ -815,291 +1102,6 @@ if __name__ == "__main__":
         '-s',
         '--durations=10',
         '-m', 'stress',
-        '--tb=short'
-    ])dte_weekly=3, dte_monthly=25,
-            is_gamma_week=False, is_gamma_month=False,
-            days_to_next_weekly=10
-        )
-        
-        print(f"\nExtreme Market Conditions Test:")
-        
-        for scenario in scenarios:
-            score = engine.calculate_scores(
-                scenario['vol'], struct, edge, external, time_m, "WEEKLY"
-            )
-            
-            mandate = engine.generate_mandate(
-                score, scenario['vol'], struct, edge, external, time_m,
-                "WEEKLY", time_m.weekly_exp, time_m.dte_weekly
-            )
-            
-            print(f"\n  {scenario['name']}:")
-            print(f"    Composite Score: {score.composite:.2f}")
-            print(f"    Regime: {mandate.regime_name}")
-            print(f"    Allocation: {mandate.allocation_pct:.1f}%")
-            print(f"    Strategy: {mandate.suggested_structure}")
-            
-            # Should produce valid output even in extreme conditions
-            assert 0 <= score.composite <= 10
-            assert 0 <= mandate.allocation_pct <= 100
-            assert mandate.max_lots >= 0
-    
-    @pytest.mark.stress
-    def test_rapid_regime_recalculation(self):
-        """Test regime calculations under rapid fire"""
-        engine = RegimeEngine()
-        
-        vol = VolMetrics(
-            spot=23500, vix=15, rv7=14, rv28=13, rv90=12,
-            garch7=14, garch28=13, park7=14, park28=13,
-            vov=3, vov_zscore=1, ivp_30d=50, ivp_90d=48, ivp_1yr=45,
-            ma20=23400, atr14=350, trend_strength=0.3,
-            vol_regime="FAIR", is_fallback=False
-        )
-        
-        struct = StructMetrics(
-            net_gex=1500000, gex_ratio=0.025, total_oi_value=60000000,
-            gex_regime="STICKY", pcr=1.05, max_pain=23500, skew_25d=1.2,
-            oi_regime="NEUTRAL", lot_size=25
-        )
-        
-        edge = EdgeMetrics(
-            iv_weekly=16, vrp_rv_weekly=2, vrp_garch_weekly=2, vrp_park_weekly=2,
-            iv_monthly=15.5, vrp_rv_monthly=2, vrp_garch_monthly=1.8, vrp_park_monthly=1.8,
-            term_spread=-0.5, term_regime="FLAT", primary_edge="SHORT_GAMMA"
-        )
-        
-        from volguard import ParticipantData
-        external = ExternalMetrics(
-            fii=ParticipantData(150000, 100000, 50000, 80000, 60000, 20000, 70000, 90000, -20000, 30000),
-            dii=None, pro=None, client=None, fii_net_change=5000,
-            flow_regime="MODERATE_LONG", fast_vol=False,
-            data_date="18-Jan-2026", event_risk="LOW"
-        )
-        
-        time_m = TimeMetrics(
-            current_date=date.today(),
-            weekly_exp=date.today() + timedelta(days=3),
-            monthly_exp=date.today() + timedelta(days=25),
-            next_weekly_exp=date.today() + timedelta(days=10),
-            dte_weekly=3, dte_monthly=25,
-            is_gamma_week=False, is_gamma_month=False,
-            days_to_next_weekly=10
-        )
-        
-        num_calculations = 1000
-        start_time = time.time()
-        
-        for _ in range(num_calculations):
-            # Slightly vary inputs
-            vol.spot = 23500 + np.random.randint(-100, 100)
-            vol.vix = 15 + np.random.uniform(-2, 2)
-            
-            score = engine.calculate_scores(
-                vol, struct, edge, external, time_m, "WEEKLY"
-            )
-        
-        elapsed = time.time() - start_time
-        
-        print(f"\nRapid Regime Recalculation Test:")
-        print(f"  Calculations: {num_calculations}")
-        print(f"  Time: {elapsed:.2f}s")
-        print(f"  Calc/sec: {num_calculations/elapsed:.0f}")
-        
-        assert elapsed < 5  # Should be very fast
-
-
-# ============================================================================
-# EXECUTION ENGINE STRESS TESTS
-# ============================================================================
-
-class TestExecutionEngineStress:
-    
-    @pytest.mark.stress
-    def test_concurrent_order_placement(self):
-        """Test execution engine with concurrent order requests"""
-        ProductionConfig.DRY_RUN_MODE = True
-        mock_client = Mock()
-        engine = ExecutionEngine(mock_client)
-        
-        def place_orders(thread_id, count):
-            results = []
-            for i in range(count):
-                order_id = engine.place_order(
-                    f"INST_{thread_id}_{i}",
-                    25,
-                    "BUY" if i % 2 == 0 else "SELL",
-                    "LIMIT",
-                    100.0 + i
-                )
-                results.append(order_id is not None)
-            return sum(results)
-        
-        num_threads = 20
-        orders_per_thread = 50
-        
-        start_time = time.time()
-        
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            futures = [
-                executor.submit(place_orders, t, orders_per_thread)
-                for t in range(num_threads)
-            ]
-            
-            results = [f.result() for f in futures]
-        
-        elapsed = time.time() - start_time
-        total_orders = sum(results)
-        
-        print(f"\nConcurrent Order Placement Test:")
-        print(f"  Threads: {num_threads}")
-        print(f"  Orders per thread: {orders_per_thread}")
-        print(f"  Total orders: {total_orders}/{num_threads * orders_per_thread}")
-        print(f"  Time: {elapsed:.2f}s")
-        print(f"  Orders/sec: {total_orders/elapsed:.0f}")
-        
-        assert total_orders >= num_threads * orders_per_thread * 0.9  # 90% success rate
-    
-    @pytest.mark.stress
-    def test_strategy_execution_under_load(self):
-        """Test full strategy execution with many concurrent legs"""
-        ProductionConfig.DRY_RUN_MODE = True
-        mock_client = Mock()
-        engine = ExecutionEngine(mock_client)
-        
-        # Create complex multi-leg strategy
-        legs = []
-        for i in range(20):  # 20 legs (extreme case)
-            legs.append({
-                'key': f'INST_{i}',
-                'strike': 23000 + (i * 100),
-                'type': 'CE' if i % 2 == 0 else 'PE',
-                'side': 'SELL' if i < 10 else 'BUY',
-                'qty': 25,
-                'ltp': 100.0 - (i * 2),
-                'role': 'CORE' if i < 10 else 'HEDGE',
-                'structure': 'COMPLEX'
-            })
-        
-        start_time = time.time()
-        result = engine.execute_strategy(legs)
-        elapsed = time.time() - start_time
-        
-        print(f"\nComplex Strategy Execution Test:")
-        print(f"  Input legs: {len(legs)}")
-        print(f"  Executed legs: {len(result)}")
-        print(f"  Time: {elapsed:.2f}s")
-        
-        # In paper mode, should execute all or fail gracefully
-        assert isinstance(result, list)
-
-
-# ============================================================================
-# MEMORY & RESOURCE STRESS TESTS
-# ============================================================================
-
-class TestResourceStress:
-    
-    @pytest.mark.stress
-    def test_memory_leak_detection(self):
-        """Test for memory leaks during extended operation"""
-        import tracemalloc
-        
-        tracemalloc.start()
-        
-        db_path = "/tmp/leak_test_db.db"
-        if os.path.exists(db_path):
-            os.remove(db_path)
-        
-        # Get baseline
-        gc.collect()
-        baseline = tracemalloc.get_traced_memory()[0]
-        
-        db = DatabaseWriter(db_path)
-        
-        # Perform 1000 operations
-        for cycle in range(10):
-            for i in range(100):
-                db.log_order(f"ORDER_{cycle}_{i}", "KEY", "BUY", 25, 100.0, "FILLED")
-                db.set_state(f"key_{i % 10}", str(time.time()))
-            
-            time.sleep(0.5)
-            gc.collect()
-            
-            current, peak = tracemalloc.get_traced_memory()
-            growth = (current - baseline) / 1024 / 1024  # MB
-            
-            if cycle % 3 == 0:
-                print(f"  Cycle {cycle}: Memory growth: {growth:.2f} MB")
-        
-        final_current, final_peak = tracemalloc.get_traced_memory()
-        final_growth = (final_current - baseline) / 1024 / 1024
-        
-        tracemalloc.stop()
-        db.shutdown()
-        
-        print(f"\nMemory Leak Detection Test:")
-        print(f"  Total operations: 1000")
-        print(f"  Final memory growth: {final_growth:.2f} MB")
-        print(f"  Peak memory: {final_peak / 1024 / 1024:.2f} MB")
-        
-        # Should not grow excessively (< 50MB for 1000 ops)
-        assert final_growth < 50
-        
-        os.remove(db_path)
-    
-    @pytest.mark.stress
-    def test_cpu_intensive_calculations(self):
-        """Test CPU usage under intensive calculations"""
-        engine = RegimeEngine()
-        
-        # Create dataset for intensive calculations
-        vol_scenarios = []
-        for i in range(100):
-            vol_scenarios.append(VolMetrics(
-                spot=23000 + i * 10,
-                vix=10 + i * 0.2,
-                rv7=9 + i * 0.18,
-                rv28=8 + i * 0.16,
-                rv90=7 + i * 0.14,
-                garch7=9 + i * 0.18,
-                garch28=8 + i * 0.16,
-                park7=9 + i * 0.18,
-                park28=8 + i * 0.16,
-                vov=2 + i * 0.03,
-                vov_zscore=0 + i * 0.02,
-                ivp_30d=20 + i * 0.6,
-                ivp_90d=18 + i * 0.58,
-                ivp_1yr=15 + i * 0.55,
-                ma20=23000 + i * 10,
-                atr14=200 + i * 3,
-                trend_strength=0.1 + i * 0.005,
-                vol_regime="FAIR",
-                is_fallback=False
-            ))
-        
-        struct = StructMetrics(
-            net_gex=1000000, gex_ratio=0.02, total_oi_value=50000000,
-            gex_regime="NEUTRAL", pcr=1.0, max_pain=23500, skew_25d=0,
-            oi_regime="NEUTRAL", lot_size=25
-        )
-        
-        edge = EdgeMetrics(
-            iv_weekly=16, vrp_rv_weekly=2, vrp_garch_weekly=2, vrp_park_weekly=2,
-            iv_monthly=15, vrp_rv_monthly=1.8, vrp_garch_monthly=1.6, vrp_park_monthly=1.7,
-            term_spread=-1, term_regime="FLAT", primary_edge="SHORT_GAMMA"
-        )
-        
-        from volguard import ParticipantData
-        external = ExternalMetrics(
-            fii=ParticipantData(150000, 100000, 50000, 80000, 60000, 20000, 70000, 90000, -20000, 30000),
-            dii=None, pro=None, client=None, fii_net_change=5000,
-            flow_regime="MODERATE_LONG", fast_vol=False,
-            data_date="18-Jan-2026", event_risk="LOW"
-        )
-        
-        time_m = TimeMetrics(
-            current_date=date.today(),
-            weekly_exp=date.today() + timedelta(days=3),
-            monthly_exp=date.today() + timedelta(days=25),
-            next_weekly_exp=date.today() + timedelta(days=10),
+        '--tb=short',
+        '--no-cov'  # Override coverage settings from pytest.ini
+    ])
