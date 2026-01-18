@@ -28,6 +28,10 @@ env:
   UPSTOX_ACCESS_TOKEN: 'test_token_placeholder'
   TELEGRAM_BOT_TOKEN: 'test_bot_token_placeholder'
   TELEGRAM_CHAT_ID: 'test_chat_id_placeholder'
+  # FIX: Override Docker paths to use local writable directories
+  VG_LOG_DIR: './volguard_logs'
+  VG_DB_PATH: './volguard_data/volguard.db'
+
 
 jobs:
   # ========================================
