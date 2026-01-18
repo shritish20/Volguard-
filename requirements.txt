@@ -1,9 +1,9 @@
-pandas==1.5.3
-numpy==1.24.3
-requests==2.31.0
-pytz==2023.3
-psutil==5.9.5
-upstox-client==1.0.0
-arch==6.2.0
 prometheus-client==0.17.1
-
+requests>=2.31.0
+pandas>=2.0.0
+numpy>=1.24.0
+pytz>=2023.3
+arch>=5.5.0
+upstox-python-sdk>=2.19.0
+scipy>=1.10.0
+psutil>=5.9.0
