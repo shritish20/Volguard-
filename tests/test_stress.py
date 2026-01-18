@@ -1,7 +1,7 @@
 """
-VOLGUARD 3.0 – STRESS & LOAD TESTS
+VOLGUARD 3.0 - STRESS & LOAD TESTS
 Tests system under extreme load and adverse conditions
-Run:  pytest test_stress.py -v -s --durations=10
+Run: pytest test_stress.py -v -s --durations=10
 """
 
 import pytest
@@ -19,11 +19,11 @@ from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from unittest.mock import Mock, patch
 
-# ------------------------------------------------------------------ setup
+# Setup
 os.environ['VG_DRY_RUN'] = 'TRUE'
-os.environ['UPSTOX_ACCESS_TOKEN']   = 'test_token'
-os.environ['TELEGRAM_BOT_TOKEN']    = 'test_bot_token'
-os.environ['TELEGRAM_CHAT_ID']      = 'test_chat_id'
+os.environ['UPSTOX_ACCESS_TOKEN'] = 'test_token'
+os.environ['TELEGRAM_BOT_TOKEN'] = 'test_bot_token'
+os.environ['TELEGRAM_CHAT_ID'] = 'test_chat_id'
 
 from volguard import (
     DatabaseWriter, CircuitBreaker, PaperTradingEngine,
@@ -32,22 +32,23 @@ from volguard import (
     ExternalMetrics, TimeMetrics, TradingMandate,
     RegimeScore, ProductionConfig
 )
-# -------------------------------------------------------------------------
 
-# =========================================================================
-#  DATABASE STRESS TESTS
-# =========================================================================
+
+# ============================================================================
+# DATABASE STRESS TESTS
+# ============================================================================
 
 class TestDatabaseStress:
-
+    
     @pytest.mark.stress
     def test_massive_concurrent_writes(self):
+        """Test database with 10,000 concurrent writes from multiple threads"""
         db_path = "/tmp/stress_test_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
+        
         db = DatabaseWriter(db_path)
-
+        
         def writer_thread(thread_id, count):
             for i in range(count):
                 db.log_order(
@@ -60,63 +61,94 @@ class TestDatabaseStress:
                     25,
                     100.0 + i
                 )
-
-        num_threads, writes_per_thread = 20, 500
+        
+        num_threads = 20
+        writes_per_thread = 500
+        
         start_time = time.time()
-
+        
         threads = []
         for t in range(num_threads):
-            th = threading.Thread(target=writer_thread, args=(t, writes_per_thread))
-            threads.append(th)
-            th.start()
-
-        for th in threads:
-            th.join(timeout=30)
-
-        # wait for queue to drain
+            thread = threading.Thread(target=writer_thread, args=(t, writes_per_thread))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join(timeout=30)
+        
+        # Wait for queue to drain
         timeout = 60
         start_wait = time.time()
         while db.message_queue.qsize() > 0 and (time.time() - start_wait) < timeout:
             time.sleep(0.1)
-
+        
         elapsed = time.time() - start_time
-
+        
+        # Verify data integrity
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM order_log")
         count = cursor.fetchone()[0]
+        
         cursor.execute("SELECT COUNT(DISTINCT order_id) FROM order_log")
         unique_count = cursor.fetchone()[0]
+        
         conn.close()
         db.shutdown()
-
-        expected = num_threads * writes_per_thread
-        print(f"\nConcurrent-write stress: {count}/{expected} written  ({count/elapsed:.0f} ops/sec)")
-        assert count == expected and unique_count == count
+        
+        expected_writes = num_threads * writes_per_thread
+        
+        print(f"\n{'='*60}")
+        print(f"Concurrent Write Stress Test Results:")
+        print(f"  Threads: {num_threads}")
+        print(f"  Writes per thread: {writes_per_thread}")
+        print(f"  Total expected: {expected_writes}")
+        print(f"  Total written: {count}")
+        print(f"  Unique orders: {unique_count}")
+        print(f"  Time elapsed: {elapsed:.2f}s")
+        print(f"  Writes/sec: {count/elapsed:.0f}")
+        print(f"{'='*60}\n")
+        
+        assert count == expected_writes, f"Expected {expected_writes} writes, got {count}"
+        assert unique_count == count, "Duplicate order IDs detected"
+        
         os.remove(db_path)
-
+    
     @pytest.mark.stress
     def test_database_under_memory_pressure(self):
+        """Test database performance when system memory is constrained"""
         db_path = "/tmp/memory_stress_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
+        
         db = DatabaseWriter(db_path)
+        
+        # Create memory pressure
         memory_hogs = []
         try:
-            # create memory pressure
+            # Allocate large arrays (but leave some memory for DB)
             for _ in range(5):
-                memory_hogs.append(np.random.rand(10_000_000))  # ~76 MB each
-
+                memory_hogs.append(np.random.rand(10000000))  # ~76MB each
+            
+            # Now stress test the database
             start_time = time.time()
+            
             for i in range(1000):
-                db.log_order(f"ORDER_{i}", "TEST_KEY", "BUY", 25, 100.0, "FILLED", 25, 100.0)
+                db.log_order(
+                    f"ORDER_{i}", "TEST_KEY", "BUY",
+                    25, 100.0, "FILLED", 25, 100.0
+                )
+                
                 if i % 100 == 0:
-                    db.save_trade(f"TRADE_{i}", "TEST", date.today(), [], 5000.0, 50000.0)
-
-            time.sleep(5)  # <-- FIX-1: give writer time to drain queue under pressure
+                    db.save_trade(
+                        f"TRADE_{i}", "TEST", date.today(),
+                        [], 5000.0, 50000.0
+                    )
+            
+            time.sleep(3)
             elapsed = time.time() - start_time
-
+            
+            # Verify writes completed
             conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM order_log")
@@ -124,176 +156,249 @@ class TestDatabaseStress:
             cursor.execute("SELECT COUNT(*) FROM trades")
             trade_count = cursor.fetchone()[0]
             conn.close()
-
-            print(f"Memory-pressure test: orders {order_count}/1000  trades {trade_count}/10")
-            assert order_count >= 990 and trade_count >= 9
+            
+            print(f"\nMemory Pressure Test:")
+            print(f"  Orders written: {order_count}/1000")
+            print(f"  Trades written: {trade_count}/10")
+            print(f"  Time: {elapsed:.2f}s")
+            
+            assert order_count >= 990  # Allow small loss
+            assert trade_count >= 9
+            
         finally:
+            # Cleanup
             del memory_hogs
             gc.collect()
             db.shutdown()
             os.remove(db_path)
-
+    
     @pytest.mark.stress
     def test_rapid_state_updates(self):
+        """Test system state updates under high frequency"""
         db_path = "/tmp/state_stress_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
+        
         db = DatabaseWriter(db_path)
-
+        
         def rapid_updater(key_prefix, iterations):
             for i in range(iterations):
                 db.set_state(f"{key_prefix}_counter", str(i))
                 db.set_state(f"{key_prefix}_timestamp", str(time.time()))
-
-        num_keys, iterations = 10, 200
+        
+        num_keys = 10
+        iterations = 200
+        
         start_time = time.time()
-
+        
         threads = []
         for k in range(num_keys):
-            th = threading.Thread(target=rapid_updater, args=(f"KEY_{k}", iterations))
-            threads.append(th)
-            th.start()
-        for th in threads:
-            th.join()
-
+            thread = threading.Thread(target=rapid_updater, args=(f"KEY_{k}", iterations))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join()
+        
         time.sleep(2)
         elapsed = time.time() - start_time
-
+        
+        # Verify final states
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM system_state")
         state_count = cursor.fetchone()[0]
         conn.close()
+        
+        print(f"\nRapid State Update Test:")
+        print(f"  Keys: {num_keys}")
+        print(f"  Updates per key: {iterations}")
+        print(f"  Total updates: {num_keys * iterations}")
+        print(f"  Final state entries: {state_count}")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Updates/sec: {(num_keys * iterations)/elapsed:.0f}")
+        
+        assert state_count == num_keys * 2  # counter + timestamp per key
+        
         db.shutdown()
-
-        print(f"Rapid-state updates: {state_count}/{num_keys*2} entries  ({(num_keys*iterations)/elapsed:.0f} ops/sec)")
-        assert state_count == num_keys * 2
         os.remove(db_path)
 
 
-# =========================================================================
-#  CIRCUIT-BREAKER STRESS
-# =========================================================================
+# ============================================================================
+# CIRCUIT BREAKER STRESS TESTS
+# ============================================================================
 
 class TestCircuitBreakerStress:
-
+    
     @pytest.mark.stress
     def test_rapid_consecutive_loss_checks(self):
+        """Test circuit breaker with rapid-fire loss notifications"""
         db_path = "/tmp/cb_stress_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
+        
         db = DatabaseWriter(db_path)
         cb = CircuitBreaker(db)
-
-        results, start_time = [], time.time()
+        
+        # Simulate 100 trades in rapid succession
+        results = []
+        start_time = time.time()
+        
         for i in range(100):
+            # Alternate wins and losses
             pnl = 1000 if i % 5 == 0 else -500
-            ok = cb.record_trade_result(pnl)
-            results.append(ok)
-            if not ok:
-                break
-
+            result = cb.record_trade_result(pnl)
+            results.append(result)
+            
+            if not result:
+                break  # Circuit breaker triggered
+        
         elapsed = time.time() - start_time
-        print(f"Circuit-breaker rapid-fire: {len(results)} checks  triggered={cb.breaker_triggered}")
+        
+        print(f"\nCircuit Breaker Stress Test:")
+        print(f"  Total checks: {len(results)}")
+        print(f"  Breaker triggered: {cb.breaker_triggered}")
+        print(f"  Consecutive losses: {cb.consecutive_losses}")
+        print(f"  Time: {elapsed:.2f}s")
+        
+        # Should eventually trigger
         assert cb.breaker_triggered or len(results) == 100
+        
         db.shutdown()
         os.remove(db_path)
-
+    
     @pytest.mark.stress
     def test_concurrent_risk_checks(self):
+        """Test circuit breaker with concurrent risk checks from multiple sources"""
         db_path = "/tmp/cb_concurrent_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
-        db   = DatabaseWriter(db_path)
-        cb   = CircuitBreaker(db)
-
+        
+        db = DatabaseWriter(db_path)
+        cb = CircuitBreaker(db)
+        
         def risk_checker(thread_id):
             for i in range(50):
-                cb.update_capital(1_000_000 - np.random.randint(0, 200_000))
+                # Random capital updates
+                new_capital = 1000000 - np.random.randint(0, 200000)
+                cb.update_capital(new_capital)
+                
+                # Random slippage events
                 if np.random.random() < 0.3:
                     cb.record_slippage_event(np.random.uniform(0.01, 0.05))
+                
                 time.sleep(0.01)
-
+        
         num_threads = 10
+        
         threads = []
         for t in range(num_threads):
-            th = threading.Thread(target=risk_checker, args=(t,))
-            threads.append(th)
-            th.start()
-        for th in threads:
-            th.join()
-
-        print(f"Concurrent risk-checks: {num_threads} threads  capital={cb.current_capital:,.0f}")
+            thread = threading.Thread(target=risk_checker, args=(t,))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join()
+        
+        print(f"\nConcurrent Risk Check Test:")
+        print(f"  Threads: {num_threads}")
+        print(f"  Breaker triggered: {cb.breaker_triggered}")
+        print(f"  Current capital: {cb.current_capital:,.0f}")
+        print(f"  Peak capital: {cb.peak_capital:,.0f}")
+        
+        # System should remain stable
         assert cb.current_capital >= 0
+        
         db.shutdown()
         os.remove(db_path)
 
 
-# =========================================================================
-#  PAPER-TRADING ENGINE STRESS
-# =========================================================================
+# ============================================================================
+# PAPER TRADING ENGINE STRESS TESTS
+# ============================================================================
 
 class TestPaperTradingStress:
-
+    
     @pytest.mark.stress
     def test_high_frequency_trading_simulation(self):
+        """Test paper engine with high-frequency order placement"""
         engine = PaperTradingEngine()
-
-        num_orders = 5_000
+        
+        num_orders = 5000
         start_time = time.time()
-
+        
         order_ids = []
         for i in range(num_orders):
-            oid = engine.place_order(
+            order_id = engine.place_order(
                 f"INSTRUMENT_{i % 100}",
                 25,
                 "BUY" if i % 2 == 0 else "SELL",
                 "LIMIT",
                 100.0 + (i % 50)
             )
-            if oid:
-                order_ids.append(oid)
-
+            if order_id:
+                order_ids.append(order_id)
+        
         elapsed = time.time() - start_time
-
+        
+        # Check status of random sample
         sample_size = min(100, len(order_ids))
-        sample_ids  = np.random.choice(order_ids, sample_size, replace=False)
-        statuses    = {'complete': 0, 'rejected': 0, 'unknown': 0}
+        sample_ids = np.random.choice(order_ids, sample_size, replace=False)
+        
+        statuses = {'complete': 0, 'rejected': 0, 'unknown': 0}
         for oid in sample_ids:
-            st = engine.get_order_status(oid)
-            if st:
-                statuses[st.get('status', 'unknown')] += 1
-
-        print(f"HFT simulation: {len(order_ids)}/{num_orders} placed  {len(order_ids)/elapsed:.0f} ops/sec")
-        assert len(order_ids) == num_orders and elapsed < 10
-
+            status = engine.get_order_status(oid)
+            if status:
+                statuses[status.get('status', 'unknown')] += 1
+        
+        print(f"\nHigh-Frequency Paper Trading Test:")
+        print(f"  Orders placed: {len(order_ids)}/{num_orders}")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Orders/sec: {len(order_ids)/elapsed:.0f}")
+        print(f"  Sample statuses: {statuses}")
+        
+        assert len(order_ids) == num_orders
+        assert elapsed < 10  # Should be very fast
+    
     @pytest.mark.stress
     def test_massive_position_accumulation(self):
+        """Test position tracking with thousands of fills"""
         engine = PaperTradingEngine()
-
-        num_instruments, orders_per = 100, 20
+        
+        # Place orders for many instruments
+        num_instruments = 100
+        orders_per_instrument = 20
+        
         for inst in range(num_instruments):
-            for _ in range(orders_per):
-                engine.place_order(f"INST_{inst}", 25, "BUY", "LIMIT", 100.0 + inst)
-
+            for order in range(orders_per_instrument):
+                engine.place_order(
+                    f"INST_{inst}",
+                    25,
+                    "BUY",
+                    "LIMIT",
+                    100.0 + inst
+                )
+        
         positions = engine.get_positions()
-        print(f"Massive-position test: {len(positions)} positions")
+        
+        print(f"\nMassive Position Test:")
+        print(f"  Total positions: {len(positions)}")
+        print(f"  Expected max: {num_instruments * 2}")  # BUY and SELL sides
+        
         assert len(positions) <= num_instruments * 2
 
 
-# =========================================================================
-#  REGIME-ENGINE STRESS
-# =========================================================================
+# ============================================================================
+# REGIME ENGINE STRESS TESTS
+# ============================================================================
 
 class TestRegimeEngineStress:
-
+    
     @pytest.mark.stress
     def test_extreme_market_conditions(self):
+        """Test regime engine under extreme market scenarios"""
         engine = RegimeEngine()
-
+        
         scenarios = [
             {
                 'name': 'Flash Crash',
@@ -326,26 +431,27 @@ class TestRegimeEngineStress:
                 )
             }
         ]
-
+        
         struct = StructMetrics(
-            net_gex=1_000_000, gex_ratio=0.02, total_oi_value=50_000_000,
+            net_gex=1000000, gex_ratio=0.02, total_oi_value=50000000,
             gex_regime="NEUTRAL", pcr=1.0, max_pain=23500, skew_25d=0,
             oi_regime="NEUTRAL", lot_size=25
         )
-
+        
         edge = EdgeMetrics(
             iv_weekly=20, vrp_rv_weekly=5, vrp_garch_weekly=4, vrp_park_weekly=4.5,
             iv_monthly=19, vrp_rv_monthly=4, vrp_garch_monthly=3, vrp_park_monthly=3.5,
             term_spread=-1, term_regime="FLAT", primary_edge="NONE"
         )
-
+        
         from volguard import ParticipantData
         external = ExternalMetrics(
-            fii=ParticipantData(100_000, 100_000, 0, 50_000, 50_000, 0, 50_000, 50_000, 0, 0),
+            fii=ParticipantData(100000, 100000, 0, 50000, 50000, 0, 50000, 50000, 0, 0),
             dii=None, pro=None, client=None, fii_net_change=0,
-            flow_regime="NEUTRAL", fast_vol=True, data_date="18-Jan-2026", event_risk="HIGH"
+            flow_regime="NEUTRAL", fast_vol=True, data_date="18-Jan-2026",
+            event_risk="HIGH"
         )
-
+        
         time_m = TimeMetrics(
             current_date=date.today(),
             weekly_exp=date.today() + timedelta(days=3),
@@ -355,21 +461,35 @@ class TestRegimeEngineStress:
             is_gamma_week=False, is_gamma_month=False,
             days_to_next_weekly=10
         )
-
-        print(f"\nExtreme-market-conditions test:")
-        for sc in scenarios:
-            score   = engine.calculate_scores(sc['vol'], struct, edge, external, time_m, "WEEKLY")
+        
+        print(f"\nExtreme Market Conditions Test:")
+        
+        for scenario in scenarios:
+            score = engine.calculate_scores(
+                scenario['vol'], struct, edge, external, time_m, "WEEKLY"
+            )
+            
             mandate = engine.generate_mandate(
-                score, sc['vol'], struct, edge, external, time_m,
+                score, scenario['vol'], struct, edge, external, time_m,
                 "WEEKLY", time_m.weekly_exp, time_m.dte_weekly
             )
-            print(f"  {sc['name']}: score={score.composite:.2f}  regime={mandate.regime_name}  alloc={mandate.allocation_pct:.1f}%")
-            assert 0 <= score.composite <= 10 and 0 <= mandate.allocation_pct <= 100 and mandate.max_lots >= 0
-
+            
+            print(f"\n  {scenario['name']}:")
+            print(f"    Composite Score: {score.composite:.2f}")
+            print(f"    Regime: {mandate.regime_name}")
+            print(f"    Allocation: {mandate.allocation_pct:.1f}%")
+            print(f"    Strategy: {mandate.suggested_structure}")
+            
+            # Should produce valid output even in extreme conditions
+            assert 0 <= score.composite <= 10
+            assert 0 <= mandate.allocation_pct <= 100
+            assert mandate.max_lots >= 0
+    
     @pytest.mark.stress
     def test_rapid_regime_recalculation(self):
+        """Test regime calculations under rapid fire"""
         engine = RegimeEngine()
-
+        
         vol = VolMetrics(
             spot=23500, vix=15, rv7=14, rv28=13, rv90=12,
             garch7=14, garch28=13, park7=14, park28=13,
@@ -377,26 +497,27 @@ class TestRegimeEngineStress:
             ma20=23400, atr14=350, trend_strength=0.3,
             vol_regime="FAIR", is_fallback=False
         )
-
+        
         struct = StructMetrics(
-            net_gex=1_500_000, gex_ratio=0.025, total_oi_value=60_000_000,
+            net_gex=1500000, gex_ratio=0.025, total_oi_value=60000000,
             gex_regime="STICKY", pcr=1.05, max_pain=23500, skew_25d=1.2,
             oi_regime="NEUTRAL", lot_size=25
         )
-
+        
         edge = EdgeMetrics(
             iv_weekly=16, vrp_rv_weekly=2, vrp_garch_weekly=2, vrp_park_weekly=2,
             iv_monthly=15.5, vrp_rv_monthly=2, vrp_garch_monthly=1.8, vrp_park_monthly=1.8,
             term_spread=-0.5, term_regime="FLAT", primary_edge="SHORT_GAMMA"
         )
-
+        
         from volguard import ParticipantData
         external = ExternalMetrics(
-            fii=ParticipantData(150_000, 100_000, 50_000, 80_000, 60_000, 20_000, 70_000, 90_000, -20_000, 30_000),
+            fii=ParticipantData(150000, 100000, 50000, 80000, 60000, 20000, 70000, 90000, -20000, 30000),
             dii=None, pro=None, client=None, fii_net_change=5000,
-            flow_regime="MODERATE_LONG", fast_vol=False, data_date="18-Jan-2026", event_risk="LOW"
+            flow_regime="MODERATE_LONG", fast_vol=False,
+            data_date="18-Jan-2026", event_risk="LOW"
         )
-
+        
         time_m = TimeMetrics(
             current_date=date.today(),
             weekly_exp=date.today() + timedelta(days=3),
@@ -406,158 +527,218 @@ class TestRegimeEngineStress:
             is_gamma_week=False, is_gamma_month=False,
             days_to_next_weekly=10
         )
-
-        num_calcs = 1000
-        start   = time.time()
-        for _ in range(num_calcs):
+        
+        num_calculations = 1000
+        start_time = time.time()
+        
+        for _ in range(num_calculations):
+            # Slightly vary inputs
             vol.spot = 23500 + np.random.randint(-100, 100)
-            vol.vix  = 15 + np.random.uniform(-2, 2)
-            engine.calculate_scores(vol, struct, edge, external, time_m, "WEEKLY")
-        elapsed = time.time() - start
+            vol.vix = 15 + np.random.uniform(-2, 2)
+            
+            score = engine.calculate_scores(
+                vol, struct, edge, external, time_m, "WEEKLY"
+            )
+        
+        elapsed = time.time() - start_time
+        
+        print(f"\nRapid Regime Recalculation Test:")
+        print(f"  Calculations: {num_calculations}")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Calc/sec: {num_calculations/elapsed:.0f}")
+        
+        assert elapsed < 5  # Should be very fast
 
-        print(f"Rapid-regime-recalc: {num_calcs} calcs  {elapsed:.2f}s  ({num_calcs/elapsed:.0f} calcs/sec)")
-        assert elapsed < 5
 
-
-# =========================================================================
-#  EXECUTION-ENGINE STRESS
-# =========================================================================
+# ============================================================================
+# EXECUTION ENGINE STRESS TESTS
+# ============================================================================
 
 class TestExecutionEngineStress:
-
+    
     @pytest.mark.stress
     def test_concurrent_order_placement(self):
+        """Test execution engine with concurrent order requests"""
         ProductionConfig.DRY_RUN_MODE = True
         mock_client = Mock()
-        engine      = ExecutionEngine(mock_client)
-
+        engine = ExecutionEngine(mock_client)
+        
         def place_orders(thread_id, count):
-            ok = 0
+            results = []
             for i in range(count):
-                oid = engine.place_order(
+                order_id = engine.place_order(
                     f"INST_{thread_id}_{i}",
                     25,
                     "BUY" if i % 2 == 0 else "SELL",
                     "LIMIT",
                     100.0 + i
                 )
-                if oid:
-                    ok += 1
-            return ok
-
-        num_threads, orders_per = 20, 50
-        start = time.time()
-        with ThreadPoolExecutor(max_workers=num_threads) as exe:
-            futures = [exe.submit(place_orders, t, orders_per) for t in range(num_threads)]
+                results.append(order_id is not None)
+            return sum(results)
+        
+        num_threads = 20
+        orders_per_thread = 50
+        
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [
+                executor.submit(place_orders, t, orders_per_thread)
+                for t in range(num_threads)
+            ]
+            
             results = [f.result() for f in futures]
-        elapsed      = time.time() - start
+        
+        elapsed = time.time() - start_time
         total_orders = sum(results)
-
-        print(f"Concurrent-order placement: {total_orders}/{num_threads*orders_per}  {total_orders/elapsed:.0f} ops/sec")
-        assert total_orders >= num_threads * orders_per * 0.9
-
+        
+        print(f"\nConcurrent Order Placement Test:")
+        print(f"  Threads: {num_threads}")
+        print(f"  Orders per thread: {orders_per_thread}")
+        print(f"  Total orders: {total_orders}/{num_threads * orders_per_thread}")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  Orders/sec: {total_orders/elapsed:.0f}")
+        
+        assert total_orders >= num_threads * orders_per_thread * 0.9  # 90% success rate
+    
     @pytest.mark.stress
     def test_strategy_execution_under_load(self):
+        """Test full strategy execution with many concurrent legs"""
         ProductionConfig.DRY_RUN_MODE = True
         mock_client = Mock()
-        engine      = ExecutionEngine(mock_client)
-
+        engine = ExecutionEngine(mock_client)
+        
+        # Create complex multi-leg strategy
         legs = []
-        for i in range(20):
+        for i in range(20):  # 20 legs (extreme case)
             legs.append({
                 'key': f'INST_{i}',
-                'strike': 23000 + i * 100,
+                'strike': 23000 + (i * 100),
                 'type': 'CE' if i % 2 == 0 else 'PE',
                 'side': 'SELL' if i < 10 else 'BUY',
                 'qty': 25,
-                'ltp': 100.0 - i * 2,
+                'ltp': 100.0 - (i * 2),
                 'role': 'CORE' if i < 10 else 'HEDGE',
                 'structure': 'COMPLEX'
             })
-
-        start   = time.time()
-        result  = engine.execute_strategy(legs)
-        elapsed = time.time() - start
-
-        print(f"Complex-strategy execution: {len(legs)} legs  {len(result)} executed  {elapsed:.2f}s")
+        
+        start_time = time.time()
+        result = engine.execute_strategy(legs)
+        elapsed = time.time() - start_time
+        
+        print(f"\nComplex Strategy Execution Test:")
+        print(f"  Input legs: {len(legs)}")
+        print(f"  Executed legs: {len(result)}")
+        print(f"  Time: {elapsed:.2f}s")
+        
+        # In paper mode, should execute all or fail gracefully
         assert isinstance(result, list)
 
 
-# =========================================================================
-#  MEMORY & RESOURCE STRESS
-# =========================================================================
+# ============================================================================
+# MEMORY & RESOURCE STRESS TESTS
+# ============================================================================
 
 class TestResourceStress:
-
+    
     @pytest.mark.stress
     def test_memory_leak_detection(self):
+        """Test for memory leaks during extended operation"""
         import tracemalloc
+        
         tracemalloc.start()
-
+        
         db_path = "/tmp/leak_test_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
+        
+        # Get baseline
         gc.collect()
         baseline = tracemalloc.get_traced_memory()[0]
-
+        
         db = DatabaseWriter(db_path)
+        
+        # Perform 1000 operations
         for cycle in range(10):
             for i in range(100):
                 db.log_order(f"ORDER_{cycle}_{i}", "KEY", "BUY", 25, 100.0, "FILLED")
                 db.set_state(f"key_{i % 10}", str(time.time()))
+            
             time.sleep(0.5)
             gc.collect()
+            
+            current, peak = tracemalloc.get_traced_memory()
+            growth = (current - baseline) / 1024 / 1024  # MB
+            
             if cycle % 3 == 0:
-                current, _ = tracemalloc.get_traced_memory()
-                print(f"  Cycle {cycle}: mem-growth {(current - baseline)/1024/1024:.2f} MB")
-
+                print(f"  Cycle {cycle}: Memory growth: {growth:.2f} MB")
+        
         final_current, final_peak = tracemalloc.get_traced_memory()
         final_growth = (final_current - baseline) / 1024 / 1024
+        
         tracemalloc.stop()
         db.shutdown()
+        
+        print(f"\nMemory Leak Detection Test:")
+        print(f"  Total operations: 1000")
+        print(f"  Final memory growth: {final_growth:.2f} MB")
+        print(f"  Peak memory: {final_peak / 1024 / 1024:.2f} MB")
+        
+        # Should not grow excessively (< 50MB for 1000 ops)
+        assert final_growth < 50
+        
         os.remove(db_path)
-
-        print(f"Memory-leak detection: 1000 ops  growth={final_growth:.2f} MB  peak={final_peak/1024/1024:.2f} MB")
-        assert final_growth < 50  # < 50 MB for 1000 ops
-
+    
     @pytest.mark.stress
     def test_cpu_intensive_calculations(self):
+        """Test CPU usage under intensive calculations"""
         engine = RegimeEngine()
-
+        
+        # Create dataset for intensive calculations
         vol_scenarios = []
         for i in range(100):
             vol_scenarios.append(VolMetrics(
                 spot=23000 + i * 10,
                 vix=10 + i * 0.2,
-                rv7=9 + i * 0.18, rv28=8 + i * 0.16, rv90=7 + i * 0.14,
-                garch7=9 + i * 0.18, garch28=8 + i * 0.16,
-                park7=9 + i * 0.18, park28=8 + i * 0.16,
-                vov=2 + i * 0.03, vov_zscore=0 + i * 0.02,
-                ivp_30d=20 + i * 0.6, ivp_90d=18 + i * 0.58, ivp_1yr=15 + i * 0.55,
-                ma20=23000 + i * 10, atr14=200 + i * 3, trend_strength=0.1 + i * 0.005,
-                vol_regime="FAIR", is_fallback=False
+                rv7=9 + i * 0.18,
+                rv28=8 + i * 0.16,
+                rv90=7 + i * 0.14,
+                garch7=9 + i * 0.18,
+                garch28=8 + i * 0.16,
+                park7=9 + i * 0.18,
+                park28=8 + i * 0.16,
+                vov=2 + i * 0.03,
+                vov_zscore=0 + i * 0.02,
+                ivp_30d=20 + i * 0.6,
+                ivp_90d=18 + i * 0.58,
+                ivp_1yr=15 + i * 0.55,
+                ma20=23000 + i * 10,
+                atr14=200 + i * 3,
+                trend_strength=0.1 + i * 0.005,
+                vol_regime="FAIR",
+                is_fallback=False
             ))
-
+        
         struct = StructMetrics(
-            net_gex=1_000_000, gex_ratio=0.02, total_oi_value=50_000_000,
+            net_gex=1000000, gex_ratio=0.02, total_oi_value=50000000,
             gex_regime="NEUTRAL", pcr=1.0, max_pain=23500, skew_25d=0,
             oi_regime="NEUTRAL", lot_size=25
         )
-
+        
         edge = EdgeMetrics(
             iv_weekly=16, vrp_rv_weekly=2, vrp_garch_weekly=2, vrp_park_weekly=2,
             iv_monthly=15, vrp_rv_monthly=1.8, vrp_garch_monthly=1.6, vrp_park_monthly=1.7,
             term_spread=-1, term_regime="FLAT", primary_edge="SHORT_GAMMA"
         )
-
+        
         from volguard import ParticipantData
         external = ExternalMetrics(
-            fii=ParticipantData(150_000, 100_000, 50_000, 80_000, 60_000, 20_000, 70_000, 90_000, -20_000, 30_000),
+            fii=ParticipantData(150000, 100000, 50000, 80000, 60000, 20000, 70000, 90000, -20000, 30000),
             dii=None, pro=None, client=None, fii_net_change=5000,
-            flow_regime="MODERATE_LONG", fast_vol=False, data_date="18-Jan-2026", event_risk="LOW"
+            flow_regime="MODERATE_LONG", fast_vol=False,
+            data_date="18-Jan-2026", event_risk="LOW"
         )
-
+        
         time_m = TimeMetrics(
             current_date=date.today(),
             weekly_exp=date.today() + timedelta(days=3),
@@ -567,211 +748,284 @@ class TestResourceStress:
             is_gamma_week=False, is_gamma_month=False,
             days_to_next_weekly=10
         )
-
-        process   = psutil.Process()
+        
+        process = psutil.Process()
         cpu_before = process.cpu_percent(interval=0.1)
-        start      = time.time()
-
+        
+        start_time = time.time()
+        
+        # Run intensive calculations
         for vol in vol_scenarios:
             score = engine.calculate_scores(vol, struct, edge, external, time_m, "WEEKLY")
-            engine.generate_mandate(score, vol, struct, edge, external, time_m,
-                                    "WEEKLY", time_m.weekly_exp, time_m.dte_weekly)
-
-        elapsed  = time.time() - start
+            mandate = engine.generate_mandate(
+                score, vol, struct, edge, external, time_m,
+                "WEEKLY", time_m.weekly_exp, time_m.dte_weekly
+            )
+        
+        elapsed = time.time() - start_time
         cpu_after = process.cpu_percent(interval=0.1)
+        
+        print(f"\nCPU Intensive Calculation Test:")
+        print(f"  Scenarios processed: {len(vol_scenarios)}")
+        print(f"  Time: {elapsed:.2f}s")
+        print(f"  CPU before: {cpu_before:.1f}%")
+        print(f"  CPU after: {cpu_after:.1f}%")
+        
+        assert elapsed < 10  # Should complete in reasonable time
 
-        print(f"CPU-intensive calcs: {len(vol_scenarios)} scenarios  {elapsed:.2f}s  CPU-before={cpu_before:.1f}%  CPU-after={cpu_after:.1f}%")
-        assert elapsed < 10
 
-
-# =========================================================================
-#  CHAOS & FAILURE INJECTION
-# =========================================================================
+# ============================================================================
+# CHAOS & FAILURE INJECTION TESTS
+# ============================================================================
 
 class TestChaosEngineering:
-
+    
     @pytest.mark.stress
     def test_database_connection_interruption(self):
-        # FIX-2: small pause so previous test releases file-lock
-        time.sleep(1)
-
+        """Test behavior when database connection is interrupted"""
         db_path = "/tmp/chaos_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
+        
         db = DatabaseWriter(db_path)
-
-        # write some data
+        
+        # Write some data
         for i in range(100):
             db.log_order(f"ORDER_{i}", "KEY", "BUY", 25, 100.0, "FILLED")
+        
         time.sleep(1)
-
-        # simulate connection interruption
+        
+        # Simulate connection interruption by corrupting db file
+        # (DB writer should handle this gracefully)
         try:
+            # Force close the connection
             db.running = False
             time.sleep(0.5)
+            
+            # Try to write (should queue or fail gracefully)
             for i in range(10):
                 db.log_order(f"ORDER_POST_{i}", "KEY", "BUY", 25, 100.0, "FILLED")
-            print("\nDatabase-interruption test: system remained stable")
+            
+            print("\nDatabase Interruption Test: System remained stable")
+            
         except Exception as e:
-            print(f"\nDatabase-interruption test: handled gracefully – {type(e).__name__}")
+            # Should not crash
+            print(f"\nDatabase Interruption Test: Handled gracefully - {type(e).__name__}")
+        
         finally:
             db.shutdown()
-            if os.path.exists(db_path):
-                os.remove(db_path)
-
+            os.remove(db_path)
+    
     @pytest.mark.stress
     def test_random_failures_during_execution(self):
+        """Test resilience to random failures"""
         ProductionConfig.DRY_RUN_MODE = True
         mock_client = Mock()
-        engine      = ExecutionEngine(mock_client)
-
-        success, failure = 0, 0
+        engine = ExecutionEngine(mock_client)
+        
+        failure_count = 0
+        success_count = 0
+        
         for i in range(100):
-            if np.random.random() < 0.2:  # 20 % fail
-                failure += 1
+            # Randomly inject failures
+            if np.random.random() < 0.2:  # 20% failure rate
+                # Simulate order failure
+                order_id = None
+                failure_count += 1
             else:
-                oid = engine.place_order(f"INST_{i}", 25, "BUY", "LIMIT", 100.0)
-                if oid:
-                    success += 1
-
-        print(f"Random-failure injection: successes={success}  failures={failure}  rate={success/(success+failure)*100:.1f}%")
-        assert success > 0
-
+                order_id = engine.place_order(
+                    f"INST_{i}", 25, "BUY", "LIMIT", 100.0
+                )
+                if order_id:
+                    success_count += 1
+        
+        print(f"\nRandom Failure Injection Test:")
+        print(f"  Successes: {success_count}")
+        print(f"  Failures: {failure_count}")
+        print(f"  Success rate: {success_count/(success_count+failure_count)*100:.1f}%")
+        
+        # System should handle failures gracefully
+        assert success_count > 0
+    
     @pytest.mark.stress
     def test_race_condition_simulation(self):
+        """Test for race conditions in concurrent operations"""
         db_path = "/tmp/race_test_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
-        db   = DatabaseWriter(db_path)
-        cb   = CircuitBreaker(db)
-
+        
+        db = DatabaseWriter(db_path)
+        cb = CircuitBreaker(db)
+        
+        # Shared state that could cause race conditions
         shared_counter = {'value': 0}
-        lock           = threading.Lock()
-
+        lock = threading.Lock()
+        
         def concurrent_updater(thread_id):
             for i in range(100):
+                # Update shared state
                 with lock:
                     shared_counter['value'] += 1
-                cb.record_trade_result(np.random.randint(-1000, 1000))
-                db.log_order(f"ORDER_T{thread_id}_N{i}", f"KEY_{thread_id}", "BUY", 25, 100.0, "FILLED")
-
+                
+                # Update circuit breaker
+                pnl = np.random.randint(-1000, 1000)
+                cb.record_trade_result(pnl)
+                
+                # Database write
+                db.log_order(
+                    f"ORDER_T{thread_id}_N{i}",
+                    f"KEY_{thread_id}",
+                    "BUY",
+                    25,
+                    100.0,
+                    "FILLED"
+                )
+        
         num_threads = 20
-        threads     = []
+        
+        threads = []
         for t in range(num_threads):
-            th = threading.Thread(target=concurrent_updater, args=(t,))
-            threads.append(th)
-            th.start()
-        for th in threads:
-            th.join()
+            thread = threading.Thread(target=concurrent_updater, args=(t,))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join()
+        
         time.sleep(2)
-
-        expected   = num_threads * 100
-        actual_ctr = shared_counter['value']
-
+        
+        # Verify data integrity
+        expected_counter = num_threads * 100
+        actual_counter = shared_counter['value']
+        
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM order_log")
         db_count = cursor.fetchone()[0]
         conn.close()
-
-        print(f"Race-condition test: counter={actual_ctr}/{expected}  DB={db_count}/{expected}")
-        assert actual_ctr == expected and db_count == expected
+        
+        print(f"\nRace Condition Test:")
+        print(f"  Expected counter: {expected_counter}")
+        print(f"  Actual counter: {actual_counter}")
+        print(f"  Database writes: {db_count}/{expected_counter}")
+        
+        assert actual_counter == expected_counter  # No race condition
+        assert db_count == expected_counter
+        
         db.shutdown()
         os.remove(db_path)
-
+    
     @pytest.mark.stress
     def test_sudden_process_termination(self):
+        """Test recovery from sudden process termination"""
         db_path = "/tmp/termination_test_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
+        
+        # Start database writer
         db = DatabaseWriter(db_path)
+        
+        # Queue up writes
         for i in range(500):
             db.log_order(f"ORDER_{i}", "KEY", "BUY", 25, 100.0, "FILLED")
-
-        # sudden "crash"
+        
+        # Sudden shutdown (simulating crash)
         db.running = False
+        
+        # Some writes may be lost, but DB should not corrupt
         time.sleep(1)
-
+        
+        # Verify database is still readable
         try:
-            conn  = sqlite3.connect(db_path)
+            conn = sqlite3.connect(db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM order_log")
             count = cursor.fetchone()[0]
             conn.close()
-            print(f"Sudden-termination test: orders={count}/500  integrity=OK")
-            assert count >= 0
+            
+            print(f"\nSudden Termination Test:")
+            print(f"  Orders written: {count}/500")
+            print(f"  Database integrity: OK")
+            
+            assert count >= 0  # DB should be readable
+            
         except sqlite3.Error as e:
             pytest.fail(f"Database corrupted after termination: {e}")
+        
         finally:
             if os.path.exists(db_path):
                 os.remove(db_path)
 
 
-# =========================================================================
-#  ENDURANCE TESTS
-# =========================================================================
+# ============================================================================
+# ENDURANCE TESTS
+# ============================================================================
 
 class TestEndurance:
-
+    
     @pytest.mark.slow
     @pytest.mark.stress
     def test_24_hour_simulation(self):
+        """Simulate 24 hours of operation (compressed to 60 seconds)"""
         db_path = "/tmp/endurance_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
-        db   = DatabaseWriter(db_path)
-        cb   = CircuitBreaker(db)
-
+        
+        db = DatabaseWriter(db_path)
+        cb = CircuitBreaker(db)
+        
         ProductionConfig.DRY_RUN_MODE = True
         mock_client = Mock()
-        engine      = ExecutionEngine(mock_client)
-
-        start          = time.time()
-        target_seconds = 60  # 60 s = 1 compressed "day"
-        trade_count    = 0
-        order_count    = 0
-
-        print("\nStarting 24-hour endurance test (60 s simulation)...")
-
-        while (time.time() - start) < target_seconds:
+        engine = ExecutionEngine(mock_client)
+        
+        # Simulate trading day
+        start_time = time.time()
+        target_duration = 60  # 60 seconds = 1 "day"
+        
+        trade_count = 0
+        order_count = 0
+        
+        print("\nStarting 24-hour endurance test (60s simulation)...")
+        
+        while (time.time() - start_time) < target_duration:
+            # Simulate market activity
+            
+            # Place some orders (simulating monitoring)
             if np.random.random() < 0.3:
-                oid = engine.place_order(f"INST_{order_count}", 25,
-                                         "BUY" if order_count % 2 == 0 else "SELL",
-                                         "LIMIT", 100.0)
-                if oid:
+                order_id = engine.place_order(
+                    f"INST_{order_count}",
+                    25,
+                    "BUY" if order_count % 2 == 0 else "SELL",
+                    "LIMIT",
+                    100.0
+                )
+                if order_id:
                     order_count += 1
-
+            
+            # Log state updates
             if order_count % 10 == 0:
                 db.set_state("current_pnl", str(np.random.randint(-5000, 5000)))
                 db.set_state("timestamp", str(time.time()))
-
-            if np.random.random() < 0.05:  # 5 % chance
+            
+            # Simulate trade results
+            if np.random.random() < 0.05:  # 5% chance per cycle
                 pnl = np.random.randint(-2000, 3000)
                 cb.record_trade_result(pnl)
                 db.update_daily_stats(trades=1, pnl=pnl)
                 trade_count += 1
-
+            
+            # Update capital
             if trade_count > 0 and trade_count % 5 == 0:
-                new_cap = 1_000_000 + np.random.randint(-50_000, 100_000)
-                cb.update_capital(new_cap)
-
-            time.sleep(0.1)
-
-        elapsed = time.time() - start
-
-        # -----------------------------------------------------------------
-        # FIX-3: wait for async writer to drain queue before checking DB
-        # -----------------------------------------------------------------
-        start_wait = time.time()
-        while db.message_queue.qsize() > 0 and (time.time() - start_wait) < 10:
-            time.sleep(0.5)
-        time.sleep(2)  # extra buffer
-        # -----------------------------------------------------------------
-
+                new_capital = 1000000 + np.random.randint(-50000, 100000)
+                cb.update_capital(new_capital)
+            
+            time.sleep(0.1)  # Simulate monitoring interval
+        
+        elapsed = time.time() - start_time
+        
+        # Verify system state
+        time.sleep(2)
+        
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM order_log")
@@ -779,50 +1033,74 @@ class TestEndurance:
         cursor.execute("SELECT COUNT(*) FROM daily_stats")
         stats_count = cursor.fetchone()[0]
         conn.close()
-
-        print(f"Endurance-test results: duration={elapsed:.2f}s  orders-placed={order_count}  orders-logged={final_order_count}  trades={trade_count}  breaker-triggered={cb.breaker_triggered}")
+        
+        print(f"\nEndurance Test Results:")
+        print(f"  Duration: {elapsed:.2f}s")
+        print(f"  Orders placed: {order_count}")
+        print(f"  Orders logged: {final_order_count}")
+        print(f"  Trades executed: {trade_count}")
+        print(f"  Circuit breaker triggered: {cb.breaker_triggered}")
+        print(f"  System status: STABLE")
+        
         db.shutdown()
         os.remove(db_path)
-
-        assert final_order_count >= order_count * 0.9
-        assert not cb.breaker_triggered or trade_count > 0
-
+        
+        assert final_order_count >= order_count * 0.9  # Allow some loss
+        assert not cb.breaker_triggered or trade_count > 0  # Only trigger if trading
+    
     @pytest.mark.slow
     @pytest.mark.stress
     def test_gradual_degradation(self):
+        """Test system behavior under gradually increasing load"""
         db_path = "/tmp/degradation_db.db"
         if os.path.exists(db_path):
             os.remove(db_path)
-
+        
         db = DatabaseWriter(db_path)
-        print("\nGradual-load-increase test:")
-
+        
+        print("\nGradual Load Increase Test:")
+        
         for phase in range(5):
-            multiplier = phase + 1
-            operations = 100 * multiplier
-
-            start = time.time()
+            load_multiplier = phase + 1
+            operations = 100 * load_multiplier
+            
+            start_time = time.time()
+            
             for i in range(operations):
-                db.log_order(f"PHASE{phase}_ORDER_{i}", f"KEY_{i % 10}", "BUY", 25, 100.0, "FILLED")
+                db.log_order(
+                    f"PHASE{phase}_ORDER_{i}",
+                    f"KEY_{i % 10}",
+                    "BUY",
+                    25,
+                    100.0,
+                    "FILLED"
+                )
+            
             time.sleep(1)
-            elapsed   = time.time() - start
+            elapsed = time.time() - start_time
+            
             queue_size = db.message_queue.qsize()
-
-            print(f"  Phase {phase+1}: {operations} ops  {elapsed:.2f}s  queue={queue_size}")
-            assert elapsed < 10 and queue_size < 5000
-
+            
+            print(f"  Phase {phase + 1}: {operations} ops, {elapsed:.2f}s, queue={queue_size}")
+            
+            # System should remain responsive
+            assert elapsed < 10
+            assert queue_size < 5000  # Queue shouldn't overflow
+        
         db.shutdown()
         os.remove(db_path)
 
 
-# =========================================================================
-#  MAIN RUNNER
-# =========================================================================
+# ============================================================================
+# MAIN TEST RUNNER
+# ============================================================================
 
 if __name__ == "__main__":
     pytest.main([
         __file__,
-        '-v', '-s', '--durations=10',
+        '-v',
+        '-s',
+        '--durations=10',
         '-m', 'stress',
         '--tb=short'
     ])
