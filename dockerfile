@@ -2,7 +2,7 @@
 FROM python:3.11-slim as builder
 WORKDIR /wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc g++ \
+    build-essential gcc \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip wheel --no-cache-dir --no-deps -w /wheels -r requirements.txt
@@ -12,12 +12,14 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
+
 COPY --from=builder /wheels /wheels
-RUN pip install --no-cache /wheels/* && rm -rf /wheels
+# FIX: Only install .whl files, ignore requirements.txt
+RUN pip install --no-cache /wheels/*.whl && rm -rf /wheels
 
 # COPY UPDATED PATHS
+COPY entrypoint.sh /entrypoint.sh
 COPY volguard/volguard.py /app/
-COPY config/entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh
 # create non-root user
