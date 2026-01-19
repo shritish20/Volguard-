@@ -6,6 +6,8 @@ services:
     container_name: volguard_v42
     restart: unless-stopped
     shm_size: 2gb
+    environment:
+      - TZ=Asia/Kolkata  # <--- CRITICAL: Forces Python to use IST
     ports:
       - "8080:8080"          # Metrics exposed on 8080 to host
     volumes:
@@ -29,6 +31,8 @@ services:
     image: prom/prometheus:v2.45.0
     container_name: volguard_prometheus
     restart: unless-stopped
+    environment:
+      - TZ=Asia/Kolkata  # <--- Forces Metrics to be recorded in IST
     ports:
       - "9090:9090"
     volumes:
@@ -54,6 +58,7 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=frser-sqlite-datasource
+      - TZ=Asia/Kolkata  # <--- Forces Dashboard logs to display IST
     volumes:
       # Mount the SAME host data folder so Grafana can see the SQLite DB
       - ./volguard_data:/var/lib/grafana/data/volguard_mount:ro
