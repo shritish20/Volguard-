@@ -1562,31 +1562,52 @@ class StrategyFactory:
         return None
 
     # ----------  EXACT MAX-LOSS ENGINE  ----------
+        # [REPLACE THE ENTIRE _calculate_defined_risk METHOD WITH THIS]
     def _calculate_defined_risk(self, legs: List[Dict], qty: int) -> float:
-        """Conservative max-loss = Σ(spread widths) – net credit"""
+        """Corrected Max Loss: Max(Width) - Net Credit"""
         if not legs: return 0.0
+        
+        # 1. Calculate Net Premium (Total Rupees)
         premiums = sum(l['ltp'] * l['qty'] for l in legs if l['side'] == 'SELL')
         debits   = sum(l['ltp'] * l['qty'] for l in legs if l['side'] == 'BUY')
         net_credit = premiums - debits
-        # --- identify spreads ---
+        
+        # 2. Identify Spreads
         ce_legs = sorted([l for l in legs if l['type'] == 'CE'], key=lambda x: x['strike'])
         pe_legs = sorted([l for l in legs if l['type'] == 'PE'], key=lambda x: x['strike'])
-        total_risk = 0.0
-        # call side
+        
+        call_risk = 0.0
+        put_risk = 0.0
+        
+        # 3. Calculate Call Side Risk (Width * Qty)
+        # Assumes standard structure: Short Inner, Long Outer
         if len(ce_legs) >= 2:
-            short_ce = next((l for l in ce_legs if l['side'] == 'SELL'), None)
-            long_ce  = next((l for l in ce_legs if l['side'] == 'BUY'), None)
-            if short_ce and long_ce:
-                total_risk += (long_ce['strike'] - short_ce['strike']) * long_ce['qty']
-        # put side
+            # Finding the primary short and long
+            shorts = [l for l in ce_legs if l['side'] == 'SELL']
+            longs = [l for l in ce_legs if l['side'] == 'BUY']
+            if shorts and longs:
+                # Worst case width: Highest Long - Lowest Short
+                width = longs[-1]['strike'] - shorts[0]['strike']
+                call_risk = width * qty
+
+        # 4. Calculate Put Side Risk (Width * Qty)
         if len(pe_legs) >= 2:
-            short_pe = next((l for l in pe_legs if l['side'] == 'SELL'), None)
-            long_pe  = next((l for l in pe_legs if l['side'] == 'BUY'), None)
-            if short_pe and long_pe:
-                total_risk += (short_pe['strike'] - long_pe['strike']) * long_pe['qty']
-        max_loss = max(0, total_risk - net_credit)
-        logger.info(f"🧮 Risk Calc: Widths={total_risk:.1f}, Credit={net_credit:.1f} → Max Loss: ₹{max_loss:,.2f}")
+            shorts = [l for l in pe_legs if l['side'] == 'SELL']
+            longs = [l for l in pe_legs if l['side'] == 'BUY']
+            if shorts and longs:
+                # Worst case width: Highest Short - Lowest Long
+                width = shorts[-1]['strike'] - longs[0]['strike']
+                put_risk = width * qty
+        
+        # 5. Correct Logic: You can only lose on ONE side at expiry
+        max_structural_risk = max(call_risk, put_risk)
+        
+        # 6. Conservative Max Loss
+        max_loss = max(0, max_structural_risk - net_credit)
+        
+        logger.info(f"🧮 Risk Calc: CallRisk={call_risk:.0f}, PutRisk={put_risk:.0f}, Credit={net_credit:.0f} -> MaxLoss={max_loss:.0f}")
         return max_loss
+
 
     # ----------  MAIN GENERATOR  ----------
     def generate(self, mandate: TradingMandate, chain: pd.DataFrame, lot_size: int, vol_metrics: VolMetrics, spot: float, struct_metrics: StructMetrics) -> Tuple[List[Dict], float]:
@@ -2276,30 +2297,47 @@ class RiskManager:
                     return
                 time.sleep(5)
 
+       # [REPLACE THE ENTIRE _calculate_pnl METHOD WITH THIS]
     def _calculate_pnl(self, prices) -> float:
-        structure = self.legs[0].get('structure', 'UNKNOWN')
-        if structure == 'IRON_FLY':
-            atm_calls = [l for l in self.legs if l['side'] == 'SELL' and l['type'] == 'CE']
-            atm_puts = [l for l in self.legs if l['side'] == 'SELL' and l['type'] == 'PE']
-            wings = [l for l in self.legs if l['side'] == 'BUY']
-            pnl = 0.0
-            for call in atm_calls:
-                ltp = getattr(prices.get(call['key']), 'last_price', call['entry_price'])
-                pnl += (call['entry_price'] - ltp) * call['filled_qty']
-            for put in atm_puts:
-                ltp = getattr(prices.get(put['key']), 'last_price', put['entry_price'])
-                pnl += (put['entry_price'] - ltp) * put['filled_qty']
-            for wing in wings:
-                ltp = getattr(prices.get(wing['key']), 'last_price', wing['entry_price'])
-                pnl += (ltp - wing['entry_price']) * wing['filled_qty']
-            return pnl
-        else:
-            pnl = 0.0
-            for leg in self.legs:
-                ltp = getattr(prices.get(leg['key']), 'last_price', leg['entry_price'])
-                leg_pnl = (leg['entry_price'] - ltp) * leg['filled_qty'] if leg['side'] == 'SELL' else (ltp - leg['entry_price']) * leg['filled_qty']
-                pnl += leg_pnl
-            return pnl
+        pnl = 0.0
+        missing_data_count = 0
+        
+        for leg in self.legs:
+            # KEY FIX: Do NOT use entry_price as default.
+            # Use 'last_known_ltp' if available, else mark as missing.
+            current_price = 0.0
+            
+            if leg['key'] in prices and hasattr(prices[leg['key']], 'last_price'):
+                current_price = prices[leg['key']].last_price
+                # Update the leg's internal memory of price
+                leg['last_known_ltp'] = current_price 
+            elif 'last_known_ltp' in leg:
+                # Fallback to the last valid price we saw in this session
+                current_price = leg['last_known_ltp']
+                logger.warning(f"⚠️ Using stale price for {leg['key']}: {current_price}")
+            else:
+                # True data loss - extremely dangerous
+                missing_data_count += 1
+                logger.error(f"❌ NO DATA for {leg['key']}")
+                continue
+
+            # Standard P&L Math
+            if leg['side'] == 'SELL':
+                leg_pnl = (leg['entry_price'] - current_price) * leg['filled_qty']
+            else:
+                leg_pnl = (current_price - leg['entry_price']) * leg['filled_qty']
+            
+            pnl += leg_pnl
+
+        # SAFETY: If we are missing data for significant legs, assume worst case or trigger fail-safe
+        if missing_data_count > 0:
+            logger.critical(f"Incomplete P&L calc due to missing data on {missing_data_count} legs")
+            # If > 50% of legs are blind, trigger emergency
+            if missing_data_count > len(self.legs) / 2:
+                self.flatten_all("DATA_FEED_LOSS")
+        
+        return pnl
+ 
 
     def _update_dashboard_state(self, current_pnl: float):
         try:
