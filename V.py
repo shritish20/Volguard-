@@ -2610,4 +2610,37 @@ def main():
         logger.info("Goodbye.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 User Interrupted (Ctrl+C)")
+    except Exception as e:
+        print(f"💥 Fatal Crash: {e}")
+        traceback.print_exc()
+    finally:
+        # --- THE ZOMBIE KILLER (Essential for Multiprocessing) ---
+        print("🧹 Cleaning up processes...")
+        
+        # 1. Stop Database safely
+        try: db_writer.shutdown() 
+        except: pass
+        
+        # 2. Stop Telegram Worker (from the Async fix)
+        try: telegram.shutdown()
+        except: pass
+        
+        # 3. Force Kill any child processes (The Analytics Engine)
+        try:
+            current_process = psutil.Process()
+            children = current_process.children(recursive=True)
+            for child in children:
+                try:
+                    print(f"💀 Killing zombie process: {child.pid}")
+                    child.terminate()
+                except: pass
+        except ImportError:
+            # Fallback if psutil isn't installed (though it is in your imports)
+            pass
+            
+        print("👋 Shutdown Complete.")
+
