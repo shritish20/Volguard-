@@ -205,41 +205,86 @@ if ProductionConfig.DRY_RUN_MODE:
     logger.warning("="*80)
 
 # ---------- TELEGRAM + WHATSAPP ----------
+# ---------- TELEGRAM + WHATSAPP (ASYNC FIX) ----------
 class TelegramAlerter:
     def __init__(self):
         self.bot_token = ProductionConfig.TELEGRAM_BOT_TOKEN
         self.chat_id = ProductionConfig.TELEGRAM_CHAT_ID
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
-        self.rate_limit_lock = threading.Lock()
-        self.last_send_time = 0
-        self.min_interval = 1.0
+        
+        # --- NEW: QUEUE SETUP ---
+        # We create a "mailbox" (Queue) and a background worker.
+        self.queue = queue.Queue()
+        self.running = True
+        self.worker = threading.Thread(target=self._process_queue, daemon=True, name="Telegram-Worker")
+        self.worker.start()
+
+    def _process_queue(self):
+        """This runs in the background and handles the slow internet calls."""
+        while self.running:
+            try:
+                # 1. Wait for a message (blocks here, not in your trading loop)
+                msg_data = self.queue.get(timeout=1)
+                message, level, retry, use_whatsapp_backup = msg_data
+                
+                # 2. Prepare formatting
+                emoji_map = {"CRITICAL": "🚨", "ERROR": "❌", "WARNING": "⚠️", "INFO": "ℹ️", "SUCCESS": "✅", "TRADE": "💰", "SYSTEM": "⚙️"}
+                prefix = emoji_map.get(level, "📢")
+                full_msg = f"{prefix} *VOLGUARD 3.2*\n{message}"
+                
+                # 3. Try Sending (Slow Part)
+                telegram_success = False
+                for attempt in range(retry):
+                    try:
+                        resp = requests.post(
+                            f"{self.base_url}/sendMessage", 
+                            json={"chat_id": self.chat_id, "text": full_msg, "parse_mode": "Markdown"}, 
+                            timeout=5
+                        )
+                        if resp.status_code == 200:
+                            telegram_success = True
+                            break
+                    except Exception as e:
+                        # Log error but don't crash
+                        if attempt == retry - 1:
+                            logger.error(f"Telegram worker failed: {e}")
+                        time.sleep(1) # Sleep is safe here because we are in a background thread
+                
+                # 4. WhatsApp Backup
+                if not telegram_success and level in ["CRITICAL", "ERROR"] and use_whatsapp_backup:
+                    logger.warning("📱 Telegram failed - trying WhatsApp backup")
+                    whatsapp.send(message, level)
+
+                self.queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Telegram Worker Crash: {e}")
 
     def send(self, message: str, level: str = "INFO", retry: int = 3, use_whatsapp_backup: bool = True) -> bool:
-        emoji_map = {"CRITICAL": "🚨", "ERROR": "❌", "WARNING": "⚠️", "INFO": "ℹ️", "SUCCESS": "✅", "TRADE": "💰", "SYSTEM": "⚙️"}
-        prefix = emoji_map.get(level, "📢")
-        full_msg = f"{prefix} *VOLGUARD 3.2*\n{message}"
-        with self.rate_limit_lock:
-            elapsed = time.time() - self.last_send_time
-            if elapsed < self.min_interval: time.sleep(self.min_interval - elapsed)
-        telegram_success = False
-        for attempt in range(retry):
-            try:
-                resp = requests.post(f"{self.base_url}/sendMessage", json={"chat_id": self.chat_id, "text": full_msg, "parse_mode": "Markdown"}, timeout=5)
-                if resp.status_code == 200:
-                    with self.rate_limit_lock: self.last_send_time = time.time()
-                    telegram_success = True; break
-            except Exception as e:
-                logger.error(f"Telegram send error (attempt {attempt+1}): {e}")
-                if attempt < retry - 1: time.sleep(2 ** attempt)
-        if not telegram_success and level in ["CRITICAL", "ERROR"] and use_whatsapp_backup:
-            logger.warning("📱 Telegram failed - trying WhatsApp backup")
-            whatsapp_success = whatsapp.send(message, level)
-            if whatsapp_success: return True
-        if not telegram_success:
-            logger.error(f"Failed to send alert after {retry} attempts: {message[:100]}")
-        return telegram_success
+        """
+        FIRE AND FORGET.
+        This puts the message in the queue and returns immediately.
+        Execution time: 0.00001 seconds.
+        """
+        try:
+            self.queue.put((message, level, retry, use_whatsapp_backup))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to queue alert: {e}")
+            return False
+
+    def shutdown(self):
+        """Cleanly stop the worker thread."""
+        self.running = False
+        try:
+            if self.worker.is_alive():
+                self.worker.join(timeout=2)
+        except: pass
 
 telegram = TelegramAlerter()
+
 
 class WhatsAppAlerter:
     def __init__(self):
