@@ -661,6 +661,28 @@ class CircuitBreaker:
 
 circuit_breaker = CircuitBreaker(db_writer)
 
+# ---------- HEARTBEAT (Health Check) ----------
+class Heartbeat:
+    def __init__(self):
+        self.file_path = os.path.join(os.path.dirname(ProductionConfig.DB_PATH), "heartbeat")
+        self.running = True
+        
+    def beat(self):
+        """Touch a file to let external monitors know we are alive"""
+        try:
+            with open(self.file_path, 'w') as f:
+                f.write(str(time.time()))
+        except: pass
+
+    def stop(self):
+        self.running = False
+        try:
+            if os.path.exists(self.file_path):
+                os.remove(self.file_path)
+        except: pass
+
+heartbeat = Heartbeat()
+
 # ---------- PAPER TRADING ----------
 class PaperTradingEngine:
     def __init__(self):
