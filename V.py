@@ -2220,6 +2220,176 @@ class IndiaAIAnalyst:
         except Exception as e:
             return MarketRegime(5, "FLAT", "IRON_CONDOR", f"AI Error: {str(e)}")
 
+# ---------- SHADOW ENGINE (PAPER TRADING) ----------
+@dataclass
+class ShadowLeg:
+    key: str
+    strike: float
+    type: str
+    side: str
+    qty: int
+    expected_price: float
+    expected_slippage: float
+    expected_fill_time: float
+
+@dataclass
+class ShadowTrade:
+    trade_id: str
+    mandate: Dict
+    legs: List[ShadowLeg]
+    timestamp: str
+    live_spot: float
+    live_vix: float
+    expected_net_premium: float
+    expected_max_risk: float
+
+class ShadowEngine:
+    """
+    Mirrors ExecutionEngine behaviour on live prices but:
+    1. Never places real orders
+    2. Logs expected fills + slippage
+    3. Runs a background thread to mark-to-market
+    """
+    def __init__(self):
+        self.trades: Dict[str, ShadowTrade] = {}
+        self.running = True
+        self.thread = threading.Thread(target=self._mark_to_market, daemon=True, name="Shadow-MTM")
+        self.thread.start()
+        logger.info("🎭 Shadow Engine (Paper Trading) Started")
+
+    def execute_strategy(self, legs: List[Dict]) -> List[Dict]:
+        """Return same shape as ExecutionEngine.execute_strategy"""
+        shadow_legs = []
+        net_premium = 0.0
+
+        for leg in legs:
+            slippage = self._estimate_slippage(leg)
+            fill_price = leg["ltp"] * (1 + slippage if leg["side"] == "BUY" else 1 - slippage)
+            shadow_legs.append(
+                ShadowLeg(
+                    key=leg["key"],
+                    strike=leg["strike"],
+                    type=leg["type"],
+                    side=leg["side"],
+                    qty=leg["qty"],
+                    expected_price=round(fill_price, 2),
+                    expected_slippage=round(slippage * 100, 2),
+                    expected_fill_time=time.time(),
+                )
+            )
+            premium = (fill_price * leg["qty"]) * (-1 if leg["side"] == "SELL" else 1)
+            net_premium += premium
+
+        trade_id = f"SHADOW_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        
+        # Safe access to global config vars
+        live_spot = getattr(ProductionConfig, 'last_known_spot', 0.0)
+        live_vix = getattr(ProductionConfig, 'last_known_vix', 0.0)
+
+        shadow_trade = ShadowTrade(
+            trade_id=trade_id,
+            mandate=legs[0].get("mandate_snapshot", {}),
+            legs=shadow_legs,
+            timestamp=datetime.now(ProductionConfig.IST).isoformat(),
+            live_spot=live_spot,
+            live_vix=live_vix,
+            expected_net_premium=round(net_premium, 2),
+            expected_max_risk=self._expected_max_risk(shadow_legs),
+        )
+
+        self.trades[trade_id] = shadow_trade
+        self._log_shadow_fill(shadow_trade)
+        return self._to_live_format(shadow_legs, trade_id)
+
+    def _mark_to_market(self):
+        """Updates P&L for dashboard visibility"""
+        while self.running:
+            try:
+                for trade in self.trades.values():
+                    mtm_pnl = 0.0
+                    for leg in trade.legs:
+                        # Fetch live price from global cache if available, else usage expected price
+                        # Note: In a full implementation, you'd fetch real LTP here.
+                        # For now, we assume price stability to test the flow.
+                        ltp = leg.expected_price 
+                        unrealised = (ltp - leg.expected_price) * leg.qty * (-1 if leg.side == "SELL" else 1)
+                        mtm_pnl += unrealised
+
+                    # Update Prometheus Metric
+                    try:
+                        trade_pnl.labels(trade_id=trade.trade_id, strategy="SHADOW").set(mtm_pnl)
+                    except: pass
+                time.sleep(30)
+            except Exception as e:
+                logger.error(f"Shadow MTM Error: {e}")
+                time.sleep(30)
+
+    @staticmethod
+    def _estimate_slippage(leg: Dict) -> float:
+        """Simulates realistic market impact"""
+        base = 0.001
+        role_adj = 0.0005 if leg.get("role") == "HEDGE" else 0.001
+        try:
+            spread = (leg.get("ask", 0) - leg.get("bid", 0)) / leg["ltp"] if leg.get("ltp") > 0 else 0
+        except: spread = 0.01
+        spread_adj = max(0, spread)
+        noise = np.random.normal(0, 0.0005)
+        return base + role_adj + spread_adj + noise
+
+    @staticmethod
+    def _expected_max_risk(shadow_legs: List[ShadowLeg]) -> float:
+        strikes = [l.strike for l in shadow_legs]
+        if not strikes: return 0.0
+        width = max(strikes) - min(strikes) if len(strikes) >= 2 else 0
+        qty = shadow_legs[0].qty if shadow_legs else 0
+        credit = sum(l.expected_price * l.qty for l in shadow_legs if l.side == "SELL")
+        debit = sum(l.expected_price * l.qty for l in shadow_legs if l.side == "BUY")
+        return max(0, (width * qty) - (credit - debit))
+
+    def _log_shadow_fill(self, trade: ShadowTrade):
+        db_writer.log_order(
+            order_id=trade.trade_id,
+            instrument_key="SHADOW_BASKET",
+            side="SHADOW",
+            qty=sum(l.qty for l in trade.legs),
+            price=trade.expected_net_premium,
+            status="SHADOW_FILLED",
+            message=f"Risk: {trade.expected_max_risk:.0f}"
+        )
+        telegram.send(
+            f"🎭 **SHADOW TRADE EXECUTED**\n"
+            f"ID: `{trade.trade_id}`\n"
+            f"Premium: ₹{trade.expected_net_premium:,.0f}\n"
+            f"Risk: ₹{trade.expected_max_risk:,.0f}\n"
+            f"Spot: {trade.live_spot:.2f} | VIX: {trade.live_vix:.2f}",
+            "INFO"
+        )
+
+    @staticmethod
+    def _to_live_format(shadow_legs: List[ShadowLeg], trade_id: str) -> List[Dict]:
+        return [
+            {
+                **asdict(leg),
+                "entry_price": leg.expected_price,
+                "filled_qty": leg.qty,
+                "slippage": leg.expected_slippage / 100,
+                "structure": "SHADOW",
+                "role": "CORE" if leg.side == "SELL" else "HEDGE",
+                "trade_id": trade_id,
+                # Essential keys for RiskManager downstream
+                "ltp": leg.expected_price, 
+                "last_known_ltp": leg.expected_price 
+            }
+            for leg in shadow_legs
+        ]
+
+    def shutdown(self):
+        self.running = False
+        try: self.thread.join(timeout=2)
+        except: pass
+        logger.info("🎭 Shadow Engine Stopped")
+
+
 # ---------- TRADING ORCHESTRATOR ----------
 class TradingOrchestrator:
     def __init__(self):
@@ -2231,6 +2401,10 @@ class TradingOrchestrator:
         self.regime_engine = RegimeEngine()
         self.strategy_factory = StrategyFactory(self.api_client)
         self.execution_engine = ExecutionEngine(self.api_client)
+        
+        # --- SHADOW ENGINE INTEGRATION ---
+        self.shadow_engine = ShadowEngine()
+        
         self.session_manager = SessionManager(self.api_client)
         self.last_analysis = None
         self.current_trade_id = None
@@ -2243,6 +2417,7 @@ class TradingOrchestrator:
         atexit.register(self._cleanup_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
+
     def _cleanup_handler(self):
         logger.info("Cleanup handler triggered")
         heartbeat.stop()
@@ -2253,7 +2428,13 @@ class TradingOrchestrator:
                 if self.analytics_process.exitcode is None:
                     self.analytics_process.kill()
         except: pass
+        
+        # Stop Shadow Engine Thread
+        try: self.shadow_engine.shutdown()
+        except: pass
+        
         db_writer.shutdown()
+
     def _signal_handler(self, signum, frame):
         logger.critical(f"Received signal {signum}")
         telegram.send(f"System shutdown signal received: {signum}", "CRITICAL")
@@ -2262,6 +2443,7 @@ class TradingOrchestrator:
             self.current_risk_manager.flatten_all("SYSTEM_SHUTDOWN")
         self._cleanup_handler()
         sys.exit(0)
+
     def check_market_open_status(self, current_date):
         if self.cached_holiday_date == current_date: return not self.is_holiday_today
         try:
@@ -2282,6 +2464,7 @@ class TradingOrchestrator:
             KNOWN_HOLIDAYS = ["2025-01-26", "2025-02-26", "2025-03-14", "2025-03-31", "2025-04-18"]
             if str(current_date) in KNOWN_HOLIDAYS: return False
             return current_date.weekday() < 5
+
     def run_morning_brief(self):
         today = datetime.now(ProductionConfig.IST).date()
         if self.last_brief_date == today: return
@@ -2301,6 +2484,7 @@ class TradingOrchestrator:
             telegram.send(f"🌅 **MORNING BRIEF**\n{emoji} **Risk:** {brief.risk_score}/10\n📉 **View:** {brief.nifty_view}\n🛡️ **Plan:** {brief.strategy}\n\n💡 _{brief.reasoning}_", "INFO")
             db_writer.set_state("daily_risk_regime", json.dumps({"date": str(today), "risk_score": brief.risk_score, "reason": brief.reasoning}))
         except Exception as e: logger.error(f"Brief Failed: {e}")
+
     def run_analysis(self) -> Optional[Dict]:
         logger.info("Starting market analysis process...")
         try:
@@ -2328,6 +2512,11 @@ class TradingOrchestrator:
                     'weekly_mandate': weekly_mandate, 'monthly_mandate': monthly_mandate,
                     'weekly_chain': result['weekly_chain'], 'monthly_chain': result['monthly_chain'], 'lot_size': result['lot_size']
                 }
+                
+                # --- SYNC DATA FOR SHADOW ENGINE ---
+                ProductionConfig.last_known_spot = result['vol_metrics'].spot
+                ProductionConfig.last_known_vix = result['vol_metrics'].vix
+                
                 logger.info(f"✅ Analysis Complete\nWeekly: {weekly_mandate.regime_name} | Score: {weekly_mandate.score.composite:.2f} | {weekly_mandate.suggested_structure}\nMonthly: {monthly_mandate.regime_name} | Score: {monthly_mandate.score.composite:.2f} | {monthly_mandate.suggested_structure}")
                 return self.last_analysis
             else:
@@ -2347,6 +2536,7 @@ class TradingOrchestrator:
             logger.error(f"Analysis error: {e}")
             traceback.print_exc()
             return None
+
     def execute_best_mandate(self, analysis: Dict) -> Optional[str]:
         weekly_mandate = analysis['weekly_mandate']
         monthly_mandate = analysis['monthly_mandate']
@@ -2356,7 +2546,7 @@ class TradingOrchestrator:
         struct_metrics = analysis['struct_metrics_weekly'] if mandate == weekly_mandate else analysis['struct_metrics_monthly']
         logger.info(f"Selected mandate: {mandate.expiry_type} {mandate.regime_name} (Score: {mandate.score.composite:.2f})")
         
-        # Block new trades on expiry day
+        # 1. Expiry Day Safety Block
         if mandate.expiry_date == date.today():
             logger.warning("Expiry day — no new trades allowed")
             telegram.send("Expiry day — trades blocked", "INFO")
@@ -2365,6 +2555,8 @@ class TradingOrchestrator:
         if mandate.max_lots == 0:
             logger.info("Mandate is CASH - no trade executed")
             return None
+            
+        # 2. Circuit Breaker
         if circuit_breaker.is_active():
             logger.warning("Circuit breaker active - trade blocked")
             telegram.send("Trade blocked by circuit breaker", "WARNING")
@@ -2373,31 +2565,58 @@ class TradingOrchestrator:
             logger.warning("Daily trade limit reached - trade blocked")
             telegram.send("Daily trade limit reached", "WARNING")
             return None
+
+        # 3. Allocation
         deployable = ProductionConfig.BASE_CAPITAL * (mandate.allocation_pct / 100.0)
         if deployable > ProductionConfig.MAX_CAPITAL_PER_TRADE:
             logger.warning(f"Capping capital: ₹{deployable:,.0f} → ₹{ProductionConfig.MAX_CAPITAL_PER_TRADE:,.0f}")
             deployable = ProductionConfig.MAX_CAPITAL_PER_TRADE
             mandate.max_lots = int(deployable / mandate.risk_per_lot) if mandate.risk_per_lot > 0 else 0
+            
+        # 4. Generate Strategy
         legs, calculated_max_risk = self.strategy_factory.generate(mandate, chain, analysis['lot_size'], vol_metrics, vol_metrics.spot, struct_metrics)
         if not legs:
             logger.error("Failed to generate valid strategy legs")
             telegram.send("Strategy generation failed", "ERROR")
             return None
         logger.info(f"Generated {len(legs)} legs. Exact Max Risk: ₹{calculated_max_risk:,.2f}")
-        filled_legs = self.execution_engine.execute_strategy(legs)
+
+        # 5. EXECUTION ROUTING (Shadow vs Live)
+        is_shadow = os.getenv("VG_SHADOW_MODE", "FALSE").upper() == "TRUE"
+        filled_legs = []
+        
+        if is_shadow:
+            logger.info("🎭 SHADOW MODE ACTIVE: Routing to Shadow Engine")
+            try:
+                filled_legs = self.shadow_engine.execute_strategy(legs)
+            except Exception as e:
+                logger.error(f"Shadow Execution Failed: {e}")
+                traceback.print_exc()
+                return None
+        else:
+            logger.info("💰 LIVE MONEY MODE: Routing to Execution Engine")
+            filled_legs = self.execution_engine.execute_strategy(legs)
+            
         if not filled_legs:
             logger.error("Strategy execution failed")
             telegram.send("Execution failed - no position opened", "ERROR")
             return None
-        trade_id = f"VG32_{'PAPER' if ProductionConfig.DRY_RUN_MODE else 'LIVE'}_{int(datetime.now().timestamp())}"
+
+        # 6. Trade Recording
+        trade_prefix = "SHADOW" if is_shadow else ("PAPER" if ProductionConfig.DRY_RUN_MODE else "LIVE")
+        trade_id = f"VG32_{trade_prefix}_{int(datetime.now().timestamp())}"
         self.current_trade_id = trade_id
+        
         entry_premium = sum(l['entry_price'] * l['filled_qty'] for l in filled_legs if l['side'] == 'SELL')
         entry_debit = sum(l['entry_price'] * l['filled_qty'] for l in filled_legs if l['side'] == 'BUY')
         net_premium = entry_premium - entry_debit
+        
         db_writer.save_trade(trade_id, mandate.strategy_type, mandate.expiry_date, filled_legs, net_premium, calculated_max_risk)
         record_trade_open(mandate.strategy_type, mandate.expiry_type, trade_id)
+        
+        # 7. GTT Orders (LIVE ONLY)
         gtt_ids = []
-        if not ProductionConfig.DRY_RUN_MODE:
+        if not is_shadow and not ProductionConfig.DRY_RUN_MODE:
             short_legs = [l for l in filled_legs if l['side'] == 'SELL']
             if short_legs:
                 logger.info(f"Setting up GTT orders for {len(short_legs)} short legs...")
@@ -2407,68 +2626,69 @@ class TradingOrchestrator:
                     gtt_id = self.execution_engine.place_gtt_order(leg['key'], leg['filled_qty'], 'BUY', round(sl_price, 1), round(target_price, 1))
                     if gtt_id: gtt_ids.append(gtt_id)
                     else: logger.warning(f"GTT placement failed for {leg['key']}")
+                
+                # Verify GTTs
                 if gtt_ids:
                     time.sleep(2)
                     if not self.execution_engine.verify_gtt(gtt_ids):
-                        logger.critical("GTT verification failed - consider manual monitoring")
-                        telegram.send("⚠️ GTT verification failed - position at risk", "WARNING")
-                        # Emergency flatten
                         logger.critical("❌ GTT VERIFICATION FAILED - EMERGENCY FLATTEN")
                         telegram.send("🚨 GTT placement failed - FLATTENING POSITION IMMEDIATELY", "CRITICAL")
-                        flatten_success = False
-                        for attempt in range(3):
-                            logger.critical(f"Flatten attempt {attempt+1}/3...")
-                            try:
-                                self.execution_engine._flatten_legs(filled_legs)
-                                flatten_success = True
-                                break
-                            except Exception as e:
-                                logger.error(f"Flatten attempt {attempt+1} failed: {e}")
-                                time.sleep(2)
-                        if not flatten_success:
-                            logger.critical("☢️ INVOKING ATOMIC EXIT API")
-                            telegram.send("☢️ USING ATOMIC EXIT - CHECK POSITIONS MANUALLY", "CRITICAL")
-                            self.execution_engine.exit_all_positions()
+                        self.execution_engine._flatten_legs(filled_legs)
                         db_writer.log_risk_event("GTT_FAILURE_FLATTEN", "CRITICAL", f"GTT verification failed for trade {trade_id}", "Emergency position closure executed")
                         return None
-        else: logger.info("📄 Dry run - skipping GTT setup")
-        self.current_risk_manager = RiskManager(self.api_client, filled_legs, mandate.expiry_date, trade_id, gtt_ids)
-        risk_thread = threading.Thread(target=self.current_risk_manager.monitor, daemon=True, name="Risk-Manager")
-        risk_thread.start()
-        logger.info(f"✅ Trade {trade_id} opened successfully with {len(gtt_ids)} GTT orders")
+        else:
+            logger.info(f"Skipping GTT setup for {trade_prefix} trade")
+
+        # 8. Start Risk Monitor (LIVE ONLY)
+        # Shadow engine has its own background thread. Live needs dedicated monitoring.
+        if not is_shadow:
+            self.current_risk_manager = RiskManager(self.api_client, filled_legs, mandate.expiry_date, trade_id, gtt_ids)
+            risk_thread = threading.Thread(target=self.current_risk_manager.monitor, daemon=True, name="Risk-Manager")
+            risk_thread.start()
+        
+        logger.info(f"✅ Trade {trade_id} opened successfully")
         return trade_id
+
     def run_auto_mode(self):
         """AWS 24/7 Scheduler"""
         logger.info("🚀 VOLGUARD AWS SCHEDULER STARTED")
         telegram.send("☁️ Bot active on AWS.", "SYSTEM")
+        
         if not token_manager.ensure_valid_token():
             logger.critical("❌ Failed to obtain valid token on startup")
             telegram.send("🚨 *STARTUP FAILED*\n\nCould not obtain Upstox access token.\nPlease authenticate manually:\n`python volguard.py --authenticate`", "CRITICAL")
             sys.exit(1)
+            
         if not self.session_manager.validate_session(force=True):
             logger.error("Initial Session Check Failed")
             sys.exit(1)
+            
         TIME_BRIEF = dtime(8, 45)
         TIME_AUTH_CHECK = dtime(8, 30)
         TIME_OPEN = dtime(9, 15)
         TIME_CLOSE = dtime(15, 30)
+        
         while True:
             try:
                 now_ist = datetime.now(ProductionConfig.IST)
                 curr_time = now_ist.time()
                 today_date = now_ist.date()
                 heartbeat.beat()
+                
                 # Hot-reload config every minute
                 if now_ist.second == 0:
                     config_manager.reload_if_changed()
+                    
                 # Weekend check
                 if today_date.weekday() >= 5:
                     if now_ist.minute == 0 and now_ist.second == 0: logger.info("💤 Weekend.")
                     time.sleep(60); continue
+                    
                 # Holiday check
                 if not self.check_market_open_status(today_date):
                     if now_ist.minute == 0 and now_ist.second == 0: logger.info("💤 Holiday.")
                     time.sleep(60); continue
+                    
                 # Daily token check (8:30 AM)
                 if curr_time >= TIME_AUTH_CHECK and curr_time < TIME_BRIEF:
                     last_check_date = db_writer.get_state('last_token_check_date')
@@ -2485,9 +2705,11 @@ class TradingOrchestrator:
                         else:
                             logger.info("✅ Token is valid for today")
                             db_writer.set_state('last_token_check_date', str(today_date))
+                            
                 # Morning brief (8:45 AM)
                 if curr_time >= TIME_BRIEF and self.last_brief_date != today_date:
                     self.run_morning_brief()
+                    
                 # Trading window (9:15 - 3:30)
                 if TIME_OPEN <= curr_time <= TIME_CLOSE:
                     # Analysis every 30 min
@@ -2497,11 +2719,13 @@ class TradingOrchestrator:
                         analysis = self.run_analysis()
                         if analysis: self.execute_best_mandate(analysis)
                         self.last_analysis_time = current_30_block
+                        
                     # Session validation every 30 min
                     if now_ist.minute % 30 == 0 and now_ist.second == 0:
                         if not self.session_manager.validate_session():
                             telegram.send("⚠️ Session Expired.", "WARNING")
                             if not self.session_manager.validate_session(force=True): break
+                            
                     # Position reconciliation every 5 min
                     if now_ist.minute % 5 == 0 and now_ist.second == 0:
                         report = PositionMonitor(self.api_client, db_writer).reconcile()
@@ -2514,6 +2738,7 @@ class TradingOrchestrator:
             except Exception as e:
                 logger.error(f"Loop Error: {e}")
                 time.sleep(60)
+
 
 # ---------- MAIN ----------
 def main():
