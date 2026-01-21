@@ -1,7 +1,5 @@
 """
-VOLGUARD 3.2 – PRODUCTION-READY
-Single-file institutional-grade option-selling system
-"""
+VOLGUARD 3.2 – 
 import os, sys, time, json, sqlite3, logging, threading, multiprocessing, traceback, signal, atexit, concurrent.futures, requests, pandas as pd, numpy as np, pytz, psutil, yfinance as yf
 from datetime import datetime, timedelta, date, time as dtime
 from typing import Optional, Dict, List, Tuple, Any
