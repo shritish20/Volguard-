@@ -1,18 +1,6 @@
 """
-VOLGUARD 3.3 - PROFESSIONAL STRATEGY EDITION
+VOLGUARD 3.3 - 
 ==============================================
-Production-Grade Option Selling System with v33 Regime Analytics
-
-Major Updates in 3.3:
-- Professional Strategies: Iron Fly, Iron Condor, Directional Spreads
-- Dynamic Weightages: Adaptive to market conditions  
-- Smart Term Structure: Auto-adjusts on expiry day
-- Enhanced Score Explanations: Detailed score drivers
-- Veto Event Detection: RBI/Fed calendar integration
-- Regime-Based Allocation: Pure strategy-driven sizing
-- AI Safety Override: Morning brief risk assessment retained
-
-Version: 3.3 Professional Production Edition
 """
 import os
 import sys
